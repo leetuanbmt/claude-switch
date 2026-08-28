@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""claude-switch — Claude Code Multi-Account Switcher.
+
+Chuyển đổi giữa nhiều tài khoản Claude Code (subscription OAuth) mà không phải
+đăng nhập lại. Chỉ hoán đổi ĐÚNG phần credential + danh tính của tài khoản:
+
+  - OAuth token : macOS Keychain (service "Claude Code-credentials")
+                  hoặc ~/.claude/.credentials.json (Linux / Windows / macOS cấu hình file)
+  - Danh tính   : 2 key `oauthAccount` + `userID` trong ~/.claude.json
+
+KHÔNG đụng tới ~/.claude/ (settings.json, CLAUDE.md, hooks, plugins, projects)
+và không đụng các key khác trong ~/.claude.json (mcpServers, projects, ...).
+Hệ quả: mọi tài khoản dùng chung lịch sử hội thoại + cấu hình, và switch chỉ tốn
+vài KB thay vì copy hàng trăm MB.
+
+Ngoại lệ duy nhất là sidebar của Claude Desktop — xem `sync_sessions`.
+
+Usage: claude-switch help
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+os.umask(0o077)  # mọi file tạo ra mặc định 600 — profile chứa refresh token
+
+# --- Đường dẫn (đều derive từ $HOME để test có thể override bằng HOME=<tmp>) ---
+HOME = Path.home()
+ACC_DIR = HOME / ".claude-accounts"        # kho profile, chmod 700
+BACKUP_DIR = ACC_DIR / "backups"           # bản sao ~/.claude.json trước mỗi lần ghi
+STATE_FILE = ACC_DIR / ".last"             # profile dùng gần nhất (cho lệnh `next`)
+CONFIG = HOME / ".claude.json"             # config gốc của Claude Code
+CREDS_FILE = HOME / ".claude" / ".credentials.json"
+KC_SERVICE = "Claude Code-credentials"     # tên service trong macOS Keychain
+
+
+def _sess_default() -> Path:
+    """Thư mục userData của Claude Desktop (Electron), khác nhau theo OS."""
+    if sys.platform == "darwin":
+        return HOME / "Library/Application Support/Claude/claude-code-sessions"
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming")
+        return base / "Claude/claude-code-sessions"
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+    return base / "Claude/claude-code-sessions"
+
+
+# Override khi cài Desktop ở chỗ khác (và để test chạy được trên mọi OS).
+SESS_DIR = Path(os.environ.get("CLAUDE_SESSIONS_DIR") or _sess_default())
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Đọc từ file VERSION cạnh script (theo symlink về repo) thay vì hằng số trong code —
+# một chỗ duy nhất để sửa khi phát hành.
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "?"
+
+
+def die(msg: str):
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ok(msg: str):
+    print(f"[OK] {msg}")
+
+
+def profile_path(name: str) -> Path:
+    # Chặn path traversal: tên profile được ghép thẳng vào ACC_DIR.
+    if not NAME_RE.match(name or ""):
+        die(f"Tên không hợp lệ: '{name}' (chỉ cho phép chữ, số, . _ -)")
+    return ACC_DIR / f"{name}.json"
+
+
+def profile_names():
+    return sorted(
+        p.stem for p in ACC_DIR.glob("*.json") if not p.name.startswith(".")
+    )
+
+
+def write_json(path: Path, data):
+    """Ghi JSON 600, atomic — không để lại file hỏng nếu bị kill giữa chừng."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except Exception:
+        return {}
+
+
+# --- Credential backend: file nếu tồn tại, ngược lại Keychain trên macOS ---
+def use_file_backend() -> bool:
+    return CREDS_FILE.exists() or sys.platform != "darwin"
+
+
+def read_creds() -> str:
+    if use_file_backend():
+        return CREDS_FILE.read_text() if CREDS_FILE.exists() else ""
+    r = subprocess.run(
+        ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+         "-s", KC_SERVICE, "-w"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def write_creds(blob: str):
+    if not blob:
+        die("credential rỗng, không ghi")
+    if use_file_backend():
+        CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CREDS_FILE.write_text(blob)
+        os.chmod(CREDS_FILE, 0o600)
+        return
+    # ponytail: blob đi qua argv nên lộ trong `ps` khoảng vài ms. `security` không
+    # nhận secret qua stdin ở chế độ non-interactive. Nâng cấp: gọi Security.framework
+    # qua Swift/ObjC nếu chạy trên máy nhiều người dùng.
+    r = subprocess.run(
+        ["security", "add-generic-password", "-U", "-a", os.environ.get("USER", ""),
+         "-s", KC_SERVICE, "-w", blob],
+        capture_output=True,
+    )
+    if r.returncode != 0:
+        die("không ghi được Keychain")
+
+
+def current_uuid() -> str:
+    return load_config().get("oauthAccount", {}).get("accountUuid") or ""
+
+
+def current_org() -> str:
+    return load_config().get("oauthAccount", {}).get("organizationUuid") or ""
+
+
+def current_profile() -> str:
+    """Tên profile trùng accountUuid đang active.
+
+    Nhận diện bằng UUID chứ không so sánh nội dung file — ~/.claude.json thay đổi
+    liên tục (numStartups, các cache) nên so sánh file luôn cho kết quả sai.
+    """
+    uuid = current_uuid()
+    if not uuid:
+        return ""
+    for name in profile_names():
+        try:
+            prof = json.loads((ACC_DIR / f"{name}.json").read_text())
+        except Exception:
+            continue
+        if prof.get("oauthAccount", {}).get("accountUuid") == uuid:
+            return name
+    return ""
+
+
+def backup_config():
+    """Giữ 10 bản gần nhất của ~/.claude.json — file duy nhất bị ghi đè."""
+    if not CONFIG.exists():
+        return
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy(CONFIG, BACKUP_DIR / f"claude.json.{stamp}.{os.getpid()}")
+    old = sorted(BACKUP_DIR.glob("claude.json.*"), key=lambda p: p.stat().st_mtime)
+    for p in old[:-10]:
+        p.unlink()
+
+
+# --- save: snapshot tài khoản đang active thành profile ---
+def cmd_save(name: str = "", quiet: bool = False):
+    creds = read_creds()
+    if not creds:
+        die("chưa đăng nhập (không tìm thấy credential). Chạy `claude` và đăng nhập trước.")
+    if not CONFIG.exists():
+        die(f"không tìm thấy {CONFIG}")
+    cfg = load_config()
+
+    # Không có tên → lấy phần trước @ của email làm tên profile.
+    if not name:
+        email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+        name = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) if email else ""
+        if not name:
+            die("không suy ra được tên từ email, truyền tên: claude-switch save <name>")
+
+    out = profile_path(name)
+    write_json(out, {
+        "credentials": json.loads(creds),
+        "oauthAccount": cfg.get("oauthAccount", {}),
+        "userID": cfg.get("userID"),
+        # snapshot % quota tại thời điểm save — dùng cho lệnh `usage`, tránh phải
+        # đăng nhập từng account rồi scrape TUI chỉ để xem còn bao nhiêu quota.
+        "usage": cfg.get("cachedUsageUtilization"),
+        "savedAt": int(time.time()),
+    })
+    if not quiet:
+        ok(f"Đã lưu profile '{name}'")
+
+
+# --- use: nạp profile vào Claude Code ---
+def cmd_use(name: str):
+    if not name:
+        die("Usage: claude-switch use <name>")
+    src = profile_path(name)
+    if not src.exists():
+        die(f"không có profile '{name}'. Xem: claude-switch list")
+    prof = json.loads(src.read_text())
+
+    # Auto-save tài khoản đang active trước khi rời đi: refresh token có thể đã được
+    # Claude Code xoay vòng, và snapshot quota cần cập nhật.
+    cur = current_profile()
+    if cur and cur != name:
+        cmd_save(cur, quiet=True)
+        print(f"[..] Đã cập nhật profile hiện tại: {cur}")
+    elif not cur and current_uuid():
+        print("[!] Tài khoản đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
+              "    Huỷ (Ctrl-C) rồi chạy: claude-switch save <name>")
+
+    backup_config()
+    cfg = load_config()
+    # Chỉ ghi đè 2 key định danh. Mọi key khác (mcpServers, projects, settings, cache)
+    # thuộc về máy chứ không thuộc về tài khoản → giữ nguyên.
+    cfg["oauthAccount"] = prof["oauthAccount"]
+    cfg["userID"] = prof["userID"]
+    cfg.pop("cachedUsageUtilization", None)  # cache của account cũ, để Claude tự fetch lại
+    write_json(CONFIG, cfg)
+
+    write_creds(json.dumps(prof["credentials"]))
+    STATE_FILE.write_text(name)
+    ok(f"Đã chuyển sang '{name}'")
+    print("    Thoát mọi phiên Claude Code đang chạy rồi mở lại — phiên cũ giữ token trong RAM.")
+
+
+# --- list / status / usage ---
+def cmd_list():
+    names = profile_names()
+    if not names:
+        print("Chưa có profile nào. Lưu tài khoản hiện tại: claude-switch save <name>")
+        return
+    cur = current_profile()
+    for n in names:
+        a = json.loads((ACC_DIR / f"{n}.json").read_text()).get("oauthAccount", {})
+        print("%s %-14s %-32s %s" % (
+            "*" if n == cur else " ", n,
+            a.get("emailAddress", "?"),
+            a.get("organizationName") or a.get("billingType") or ""))
+
+
+def cmd_status():
+    cur = current_profile()
+    if cur:
+        ok(f"Đang dùng: {cur}")
+    elif current_uuid():
+        print("[?] Đang đăng nhập một tài khoản chưa được lưu thành profile")
+    else:
+        print("[?] Chưa đăng nhập")
+
+
+def cmd_usage():
+    names = profile_names()
+    if not names:
+        print("Chưa có profile nào.")
+        return
+
+    def pct(u, key):
+        b = (u or {}).get(key)
+        if not b:
+            return "  ?  ", ""
+        resets = b.get("resets_at") or ""
+        if resets:
+            try:
+                resets = "reset " + datetime.fromisoformat(resets).astimezone().strftime("%d/%m %H:%M")
+            except Exception:
+                pass
+        return "%3d%%" % b.get("utilization", 0), resets
+
+    print("%-14s %-28s %-6s %-6s %s" % ("PROFILE", "EMAIL", "5H", "7D", "SNAPSHOT"))
+    for n in names:
+        p = json.loads((ACC_DIR / f"{n}.json").read_text())
+        u = (p.get("usage") or {}).get("utilization")
+        h5, _ = pct(u, "five_hour")
+        d7, r7 = pct(u, "seven_day")
+        saved = p.get("savedAt")
+        age = "%dh trước" % ((time.time() - saved) / 3600) if saved else "?"
+        print("%-14s %-28s %-6s %-6s %s  %s" % (
+            n, p.get("oauthAccount", {}).get("emailAddress", "?"), h5, d7, age, r7))
+    print("\nSố liệu là snapshot lúc profile được lưu (tự cập nhật mỗi lần switch).")
+    print("Muốn số liệu realtime của tài khoản đang dùng: claude  →  /usage")
+
+
+def cmd_next():
+    names = profile_names()
+    if not names:
+        die("chưa có profile nào")
+    last = current_profile() or (STATE_FILE.read_text() if STATE_FILE.exists() else "")
+    idx = names.index(last) if last in names else -1
+    cmd_use(names[(idx + 1) % len(names)])
+
+
+def cmd_remove(name: str):
+    if not name:
+        die("Usage: claude-switch remove <name>")
+    f = profile_path(name)
+    if not f.exists():
+        die(f"không có profile '{name}'")
+    f.unlink()
+    ok(f"Đã xoá profile '{name}' (tài khoản trên server không bị ảnh hưởng)")
+
+
+# --- sync-sessions: gộp danh sách session của Desktop về tài khoản đang dùng ---
+def cmd_sync_sessions():
+    """Nội dung hội thoại nằm ở ~/.claude/projects (dùng chung, switch không đụng tới),
+    nhưng Desktop chỉ đọc ĐÚNG MỘT thư mục <accountUuid>/<orgUuid> của account+org đang
+    đăng nhập → đổi account là danh sách trống. Copy metadata từ mọi thư mục khác vào đó.
+    """
+    uuid, org = current_uuid(), current_org()
+    if not uuid or not org:
+        die("chưa đăng nhập, không biết gộp về đâu")
+    if not SESS_DIR.is_dir():
+        die(f"không có {SESS_DIR} — Claude Desktop chưa chạy lần nào? "
+            "Đường dẫn khác thì đặt CLAUDE_SESSIONS_DIR")
+
+    # Phải đổi cả orgUuid, không giữ org gốc: giữ nguyên thì file nằm ở thư mục Desktop
+    # không bao giờ đọc tới.
+    dst = SESS_DIR / uuid / org
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for src in sorted(SESS_DIR.glob("*/*")):
+        if not src.is_dir() or src == dst:
+            continue
+        for f in sorted(src.glob("local_*.json")):  # bỏ deleted_*, scheduled-tasks.json
+            # Không ghi đè: bản ở đích mới hơn (lastFocusedAt, title đã sửa).
+            if (dst / f.name).exists():
+                continue
+            shutil.copy(f, dst / f.name)
+            n += 1
+
+    ok(f"Đã gộp {n} session vào tài khoản đang dùng")
+    print("    Thoát hẳn Claude Desktop (⌘Q) rồi mở lại để thấy danh sách mới.")
+
+
+def cmd_help():
+    print(f"""claude-switch {VERSION} — chuyển đổi nhiều tài khoản Claude Code
+
+  claude-switch save [name]   Lưu tài khoản đang đăng nhập (bỏ trống name → lấy từ email)
+  claude-switch <name>        Chuyển sang tài khoản đã lưu
+  claude-switch list          Danh sách profile (* = đang dùng)
+  claude-switch status        Tài khoản đang dùng
+  claude-switch usage         Bảng quota 5h / 7 ngày của mọi profile
+  claude-switch next          Chuyển sang profile kế tiếp (vòng tròn)
+  claude-switch remove <name> Xoá profile
+  claude-switch sync-sessions Gộp danh sách session Desktop của mọi account về account đang dùng
+  claude-switch version       In phiên bản
+
+Profile lưu ở ~/.claude-accounts (chmod 700, file 600) và CHỨA REFRESH TOKEN —
+đừng commit hay sync thư mục này lên cloud.
+
+Sau khi switch phải thoát và mở lại Claude Code; phiên đang chạy giữ token trong RAM.""")
+
+
+def main():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(ACC_DIR, 0o700)
+    os.chmod(BACKUP_DIR, 0o700)
+
+    argv = sys.argv[1:] or ["help"]
+    cmd, args = argv[0], argv[1:]
+    arg = args[0] if args else ""
+
+    if cmd == "save":
+        cmd_save(arg)
+    elif cmd == "use":
+        cmd_use(arg)
+    elif cmd in ("list", "ls"):
+        cmd_list()
+    elif cmd in ("status", "current"):
+        cmd_status()
+    elif cmd == "usage":
+        cmd_usage()
+    elif cmd == "next":
+        cmd_next()
+    elif cmd in ("remove", "rm"):
+        cmd_remove(arg)
+    elif cmd == "sync-sessions":
+        cmd_sync_sessions()
+    elif cmd in ("version", "-v", "--version"):
+        print(VERSION)
+    elif cmd in ("help", "-h", "--help"):
+        cmd_help()
+    else:
+        cmd_use(cmd)  # `claude-switch work` = `claude-switch use work`
+
+
+if __name__ == "__main__":
+    main()
