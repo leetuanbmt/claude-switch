@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-lightgrey">
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen">
   <img alt="tests" src="https://img.shields.io/badge/tests-14%2F14-brightgreen">
@@ -22,13 +22,20 @@ lịch sử hội thoại.
 
 ## Cài đặt
 
+**macOS / Linux / WSL:**
 ```bash
 git clone https://github.com/leetuanbmt/claude-switch.git
 cd claude-switch && ./install.sh
 ```
 
-Symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`,
-`/opt/homebrew/bin`). Yêu cầu duy nhất là `python3` — macOS và Ubuntu cài sẵn.
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/leetuanbmt/claude-switch.git
+cd claude-switch; .\install.ps1
+```
+
+Script cài đặt sẽ tạo symlink hoặc shim vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`,
+`/opt/homebrew/bin`). Yêu cầu duy nhất là Python 3.8+ (`python3` hoặc `python`).
 
 ## Bắt đầu
 
@@ -121,13 +128,11 @@ lần switch sang account hoặc org khác thì chạy lại, do thư mục đí
 |---|---|---|---|
 | macOS | Keychain `Claude Code-credentials` | `~/Library/Application Support/Claude/…` | Đã test (macOS 26) |
 | Linux / WSL | `~/.claude/.credentials.json` | `~/.config/Claude/…` | Đã test (Ubuntu 24.04, Python 3.12) |
-| Windows | `~/.claude/.credentials.json` | `%APPDATA%/Claude/…` | Chưa hỗ trợ — dùng WSL |
+| Windows | `~/.claude/.credentials.json` | `%APPDATA%/Claude/…` | Đã test (Windows 11, Python 3.13) |
 
 Đặt `CLAUDE_SESSIONS_DIR` nếu Claude Desktop cài ở đường dẫn khác mặc định.
 
-Windows chưa hỗ trợ vì hai lý do: chưa xác minh Claude Code bản Windows lưu OAuth
-token ở file hay Credential Manager, và `chmod 600` vô hiệu trên NTFS nên refresh
-token sẽ nằm không có bảo vệ quyền file.
+> **Lưu ý trên Windows:** Hệ thống tệp NTFS không dùng các bit quyền POSIX (`chmod 600`), nên refresh token lưu trong `~/.claude-accounts/` sẽ được bảo vệ bởi quyền truy cập tài khoản người dùng Windows tương ứng (User ACLs).
 
 ## Bảo mật
 

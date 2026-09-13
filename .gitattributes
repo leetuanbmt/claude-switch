@@ -1,0 +1,3 @@
+# Giữ LF line endings cho shell script và Python executable trên mọi hệ điều hành
+*.sh text eol=lf
+claude-switch text eol=lf
