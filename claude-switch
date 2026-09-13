@@ -27,10 +27,17 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+# Đảm bảo I/O tiếng Việt / UTF-8 trên Windows console (tránh UnicodeEncodeError)
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
 os.umask(0o077)  # mọi file tạo ra mặc định 600 — profile chứa refresh token
 
 # --- Đường dẫn (đều derive từ $HOME để test có thể override bằng HOME=<tmp>) ---
-HOME = Path.home()
+HOME = Path(os.environ.get("CLAUDE_HOME") or os.environ.get("HOME") or Path.home())
 ACC_DIR = HOME / ".claude-accounts"        # kho profile, chmod 700
 BACKUP_DIR = ACC_DIR / "backups"           # bản sao ~/.claude.json trước mỗi lần ghi
 STATE_FILE = ACC_DIR / ".last"             # profile dùng gần nhất (cho lệnh `next`)
@@ -44,6 +51,14 @@ def _sess_default() -> Path:
     if sys.platform == "darwin":
         return HOME / "Library/Application Support/Claude/claude-code-sessions"
     if os.name == "nt":
+        # Ưu tiên kiểm tra bản cài đặt qua Microsoft Store (MSIX package)
+        local_appdata = Path(os.environ.get("LOCALAPPDATA") or HOME / "AppData/Local")
+        msix = (
+            local_appdata
+            / "Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code-sessions"
+        )
+        if msix.exists():
+            return msix
         base = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming")
         return base / "Claude/claude-code-sessions"
     base = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
@@ -58,7 +73,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # Đọc từ file VERSION cạnh script (theo symlink về repo) thay vì hằng số trong code —
 # một chỗ duy nhất để sửa khi phát hành.
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
-VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "?"
+VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "?"
 
 
 def die(msg: str):
@@ -87,14 +102,14 @@ def write_json(path: Path, data):
     """Ghi JSON 600, atomic — không để lại file hỏng nếu bị kill giữa chừng."""
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
 
 
 def load_config() -> dict:
     try:
-        return json.loads(CONFIG.read_text())
+        return json.loads(CONFIG.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -106,7 +121,7 @@ def use_file_backend() -> bool:
 
 def read_creds() -> str:
     if use_file_backend():
-        return CREDS_FILE.read_text() if CREDS_FILE.exists() else ""
+        return CREDS_FILE.read_text(encoding="utf-8") if CREDS_FILE.exists() else ""
     r = subprocess.run(
         ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
          "-s", KC_SERVICE, "-w"],
@@ -120,7 +135,7 @@ def write_creds(blob: str):
         die("credential rỗng, không ghi")
     if use_file_backend():
         CREDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        CREDS_FILE.write_text(blob)
+        CREDS_FILE.write_text(blob, encoding="utf-8")
         os.chmod(CREDS_FILE, 0o600)
         return
     # ponytail: blob đi qua argv nên lộ trong `ps` khoảng vài ms. `security` không
@@ -154,7 +169,7 @@ def current_profile() -> str:
         return ""
     for name in profile_names():
         try:
-            prof = json.loads((ACC_DIR / f"{name}.json").read_text())
+            prof = json.loads((ACC_DIR / f"{name}.json").read_text(encoding="utf-8"))
         except Exception:
             continue
         if prof.get("oauthAccount", {}).get("accountUuid") == uuid:
@@ -210,7 +225,7 @@ def cmd_use(name: str):
     src = profile_path(name)
     if not src.exists():
         die(f"không có profile '{name}'. Xem: claude-switch list")
-    prof = json.loads(src.read_text())
+    prof = json.loads(src.read_text(encoding="utf-8"))
 
     # Auto-save tài khoản đang active trước khi rời đi: refresh token có thể đã được
     # Claude Code xoay vòng, và snapshot quota cần cập nhật.
@@ -232,7 +247,7 @@ def cmd_use(name: str):
     write_json(CONFIG, cfg)
 
     write_creds(json.dumps(prof["credentials"]))
-    STATE_FILE.write_text(name)
+    STATE_FILE.write_text(name, encoding="utf-8")
     ok(f"Đã chuyển sang '{name}'")
     print("    Thoát mọi phiên Claude Code đang chạy rồi mở lại — phiên cũ giữ token trong RAM.")
 
@@ -245,7 +260,7 @@ def cmd_list():
         return
     cur = current_profile()
     for n in names:
-        a = json.loads((ACC_DIR / f"{n}.json").read_text()).get("oauthAccount", {})
+        a = json.loads((ACC_DIR / f"{n}.json").read_text(encoding="utf-8")).get("oauthAccount", {})
         print("%s %-14s %-32s %s" % (
             "*" if n == cur else " ", n,
             a.get("emailAddress", "?"),
@@ -275,14 +290,15 @@ def cmd_usage():
         resets = b.get("resets_at") or ""
         if resets:
             try:
-                resets = "reset " + datetime.fromisoformat(resets).astimezone().strftime("%d/%m %H:%M")
+                dt = datetime.fromisoformat(resets).astimezone()
+                resets = "reset " + dt.strftime("%d/%m %H:%M")
             except Exception:
                 pass
         return "%3d%%" % b.get("utilization", 0), resets
 
     print("%-14s %-28s %-6s %-6s %s" % ("PROFILE", "EMAIL", "5H", "7D", "SNAPSHOT"))
     for n in names:
-        p = json.loads((ACC_DIR / f"{n}.json").read_text())
+        p = json.loads((ACC_DIR / f"{n}.json").read_text(encoding="utf-8"))
         u = (p.get("usage") or {}).get("utilization")
         h5, _ = pct(u, "five_hour")
         d7, r7 = pct(u, "seven_day")
@@ -298,7 +314,9 @@ def cmd_next():
     names = profile_names()
     if not names:
         die("chưa có profile nào")
-    last = current_profile() or (STATE_FILE.read_text() if STATE_FILE.exists() else "")
+    last = current_profile() or (
+        STATE_FILE.read_text(encoding="utf-8") if STATE_FILE.exists() else ""
+    )
     idx = names.index(last) if last in names else -1
     cmd_use(names[(idx + 1) % len(names)])
 
