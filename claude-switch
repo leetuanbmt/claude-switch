@@ -17,7 +17,10 @@ Ngoại lệ duy nhất là sidebar của Claude Desktop — xem `sync_sessions`
 
 Usage: claude-switch help
 """
+import contextlib
+import io
 import json
+import locale
 import os
 import re
 import shutil
@@ -26,6 +29,15 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: không có khoá file, bỏ qua
+    fcntl = None
+try:
+    import curses
+except ImportError:  # Windows không có curses: CLI vẫn chạy, chỉ TUI tắt
+    curses = None
 
 os.umask(0o077)  # mọi file tạo ra mặc định 600 — profile chứa refresh token
 
@@ -162,6 +174,29 @@ def current_profile() -> str:
     return ""
 
 
+@contextlib.contextmanager
+def lock():
+    """Một lệnh ghi tại một thời điểm — hai lệnh switch chạy chồng sẽ ghi đè credential của nhau."""
+    if fcntl is None:
+        yield
+        return
+    with open(ACC_DIR / ".lock", "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die("đang có lệnh claude-switch khác chạy — thử lại sau vài giây")
+        yield
+
+
+def claude_running() -> int:
+    """Số tiến trình `claude` đang chạy; 0 nếu máy không có pgrep."""
+    try:
+        r = subprocess.run(["pgrep", "-x", "claude"], capture_output=True, text=True)
+    except OSError:
+        return 0
+    return len(r.stdout.split())
+
+
 def backup_config():
     """Giữ 10 bản gần nhất của ~/.claude.json — file duy nhất bị ghi đè."""
     if not CONFIG.exists():
@@ -171,6 +206,11 @@ def backup_config():
     old = sorted(BACKUP_DIR.glob("claude.json.*"), key=lambda p: p.stat().st_mtime)
     for p in old[:-10]:
         p.unlink()
+
+
+def name_from_email(cfg: dict) -> str:
+    email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+    return re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) if email else ""
 
 
 # --- save: snapshot tài khoản đang active thành profile ---
@@ -184,8 +224,7 @@ def cmd_save(name: str = "", quiet: bool = False):
 
     # Không có tên → lấy phần trước @ của email làm tên profile.
     if not name:
-        email = cfg.get("oauthAccount", {}).get("emailAddress", "")
-        name = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) if email else ""
+        name = name_from_email(cfg)
         if not name:
             die("không suy ra được tên từ email, truyền tên: claude-switch save <name>")
 
@@ -234,22 +273,19 @@ def cmd_use(name: str):
     write_creds(json.dumps(prof["credentials"]))
     STATE_FILE.write_text(name)
     ok(f"Đã chuyển sang '{name}'")
-    print("    Thoát mọi phiên Claude Code đang chạy rồi mở lại — phiên cũ giữ token trong RAM.")
+    n = claude_running()
+    print(f"    Đang có {n} tiến trình claude chạy bằng token cũ — thoát hẳn rồi mở lại." if n
+          else "    Mở Claude Code để dùng tài khoản mới.")
 
 
 # --- list / status / usage ---
 def cmd_list():
-    names = profile_names()
-    if not names:
+    rows = load_rows()
+    if not rows:
         print("Chưa có profile nào. Lưu tài khoản hiện tại: claude-switch save <name>")
         return
-    cur = current_profile()
-    for n in names:
-        a = json.loads((ACC_DIR / f"{n}.json").read_text()).get("oauthAccount", {})
-        print("%s %-14s %-32s %s" % (
-            "*" if n == cur else " ", n,
-            a.get("emailAddress", "?"),
-            a.get("organizationName") or a.get("billingType") or ""))
+    for r in rows:
+        print("%s %-14s %-32s %s" % ("*" if r["cur"] else " ", r["name"], r["email"], r["org"]))
 
 
 def cmd_status():
@@ -263,13 +299,13 @@ def cmd_status():
 
 
 def cmd_usage():
-    names = profile_names()
-    if not names:
+    rows = load_rows()
+    if not rows:
         print("Chưa có profile nào.")
         return
 
     def pct(u, key):
-        b = (u or {}).get(key)
+        b = u.get(key)
         if not b:
             return "  ?  ", ""
         resets = b.get("resets_at") or ""
@@ -280,18 +316,14 @@ def cmd_usage():
                 pass
         return "%3d%%" % b.get("utilization", 0), resets
 
-    print("%-14s %-28s %-6s %-6s %s" % ("PROFILE", "EMAIL", "5H", "7D", "SNAPSHOT"))
-    for n in names:
-        p = json.loads((ACC_DIR / f"{n}.json").read_text())
-        u = (p.get("usage") or {}).get("utilization")
-        h5, _ = pct(u, "five_hour")
-        d7, r7 = pct(u, "seven_day")
-        saved = p.get("savedAt")
-        age = "%dh trước" % ((time.time() - saved) / 3600) if saved else "?"
-        print("%-14s %-28s %-6s %-6s %s  %s" % (
-            n, p.get("oauthAccount", {}).get("emailAddress", "?"), h5, d7, age, r7))
-    print("\nSố liệu là snapshot lúc profile được lưu (tự cập nhật mỗi lần switch).")
-    print("Muốn số liệu realtime của tài khoản đang dùng: claude  →  /usage")
+    print("%-14s %-28s %-6s %-6s %-6s %s" % ("PROFILE", "EMAIL", "5H", "7D", "NGUỒN", ""))
+    for r in rows:
+        h5, _ = pct(r["usage"], "five_hour")
+        d7, r7 = pct(r["usage"], "seven_day")
+        print("%-14s %-28s %-6s %-6s %-6s %s" % (
+            r["name"], r["email"], h5, d7, "live" if r["live"] else _age(r["saved"]), r7))
+    print("\nlive = tài khoản đang dùng, đọc từ ~/.claude.json. Còn lại là snapshot lúc profile")
+    print("được lưu (tự cập nhật mỗi lần switch). Số realtime: claude  →  /usage")
 
 
 def cmd_next():
@@ -313,11 +345,75 @@ def cmd_remove(name: str):
     ok(f"Đã xoá profile '{name}' (tài khoản trên server không bị ảnh hưởng)")
 
 
+def cmd_doctor():
+    bad = 0
+
+    def line(level, msg):
+        nonlocal bad
+        print({"ok": "[OK]   ", "warn": "[!]    ", "err": "[ERROR]"}[level], msg)
+        bad += level == "err"
+
+    for v in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        if os.environ.get(v):
+            line("warn", f"biến {v} đang đặt — nó ưu tiên hơn credential đã đăng nhập, "
+                         "nên switch không có tác dụng trong shell này")
+    line("ok", "credential: " + ("file " + str(CREDS_FILE) if use_file_backend() else "macOS Keychain"))
+    if not read_creds():
+        line("warn", "chưa đăng nhập (không có credential)")
+    if ACC_DIR.stat().st_mode & 0o077:
+        line("err", f"{ACC_DIR} cho phép nhóm/người khác truy cập — chạy: chmod 700 {ACC_DIR}")
+
+    uuids = {}
+    for n in profile_names():
+        f = ACC_DIR / f"{n}.json"
+        if f.stat().st_mode & 0o077:
+            line("err", f"profile '{n}' chứa refresh token nhưng không phải chmod 600")
+        try:
+            p = json.loads(f.read_text())
+            u = p["oauthAccount"]["accountUuid"]
+            assert p["credentials"] and p["userID"]
+        except Exception:
+            line("err", f"profile '{n}' hỏng hoặc thiếu trường — lưu lại: claude-switch save {n}")
+            continue
+        uuids.setdefault(u, []).append(n)
+    for names in uuids.values():
+        if len(names) > 1:
+            line("warn", f"các profile {', '.join(names)} là cùng một tài khoản")
+    if current_uuid() and not current_profile():
+        line("warn", "tài khoản đang đăng nhập chưa được lưu thành profile")
+    n = claude_running()
+    if n:
+        line("ok", f"{n} tiến trình claude đang chạy (giữ token cũ nếu bạn vừa switch)")
+    line("ok" if SESS_DIR.is_dir() else "warn",
+         f"Claude Desktop sessions: {SESS_DIR}" + ("" if SESS_DIR.is_dir() else " (chưa có — bỏ qua nếu không dùng Desktop)"))
+    print("\nKhông phát hiện lỗi." if not bad else f"\n{bad} lỗi cần sửa.")
+    sys.exit(1 if bad else 0)
+
+
 # --- sync-sessions: gộp danh sách session của Desktop về tài khoản đang dùng ---
-def cmd_sync_sessions():
-    """Nội dung hội thoại nằm ở ~/.claude/projects (dùng chung, switch không đụng tới),
+def account_labels() -> dict:
+    """accountUuid -> tên profile, để gắn nhãn nguồn cho session."""
+    out = {}
+    for n in profile_names():
+        try:
+            out[json.loads((ACC_DIR / f"{n}.json").read_text())["oauthAccount"]["accountUuid"]] = n
+        except Exception:
+            pass
+    return out
+
+
+def _sess_ts(f: Path, meta: dict) -> float:
+    """Thời điểm hoạt động cuối (giây). lastActivityAt là epoch mili-giây."""
+    return (meta.get("lastActivityAt") or f.stat().st_mtime * 1000) / 1000
+
+
+def session_candidates():
+    """(thư mục đích, session nằm ở thư mục <account>/<org> khác đích), mới nhất trước.
+
+    Nội dung hội thoại nằm ở ~/.claude/projects (dùng chung, switch không đụng tới),
     nhưng Desktop chỉ đọc ĐÚNG MỘT thư mục <accountUuid>/<orgUuid> của account+org đang
-    đăng nhập → đổi account là danh sách trống. Copy metadata từ mọi thư mục khác vào đó.
+    đăng nhập → đổi account là danh sách trống. Phải đổi cả orgUuid khi copy, không giữ
+    org gốc: giữ nguyên thì file nằm ở thư mục Desktop không bao giờ đọc tới.
     """
     uuid, org = current_uuid(), current_org()
     if not uuid or not org:
@@ -325,28 +421,699 @@ def cmd_sync_sessions():
     if not SESS_DIR.is_dir():
         die(f"không có {SESS_DIR} — Claude Desktop chưa chạy lần nào? "
             "Đường dẫn khác thì đặt CLAUDE_SESSIONS_DIR")
-
-    # Phải đổi cả orgUuid, không giữ org gốc: giữ nguyên thì file nằm ở thư mục Desktop
-    # không bao giờ đọc tới.
-    dst = SESS_DIR / uuid / org
-    dst.mkdir(parents=True, exist_ok=True)
-    n = 0
+    dst, labels, out = SESS_DIR / uuid / org, account_labels(), []
     for src in sorted(SESS_DIR.glob("*/*")):
         if not src.is_dir() or src == dst:
             continue
         for f in sorted(src.glob("local_*.json")):  # bỏ deleted_*, scheduled-tasks.json
-            # Không ghi đè: bản ở đích mới hơn (lastFocusedAt, title đã sửa).
-            if (dst / f.name).exists():
-                continue
-            shutil.copy(f, dst / f.name)
-            n += 1
+            try:
+                meta = json.loads(f.read_text())
+            except Exception:
+                meta = {}
+            d = dst / f.name
+            out.append({
+                "path": f, "name": f.name, "src_uuid": src.parent.name,
+                "src": labels.get(src.parent.name, src.parent.name[:8]),
+                "ids": [f.stem, meta.get("cliSessionId") or ""],
+                "title": meta.get("title") or "(không tên)", "cwd": meta.get("cwd") or "",
+                "ts": _sess_ts(f, meta),
+                "dst_ts": _sess_ts(d, _load_json(d)) if d.exists() else None,
+            })
+    out.sort(key=lambda x: -x["ts"])
+    return dst, out
 
+
+def _load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def plan_sync(cands, from_="", ids=(), update=False):
+    """Mỗi session → (hành động, session): copy | update | skip.
+
+    Mặc định không ghi đè bản ở đích (nó mới hơn: lastFocusedAt, title đã sửa);
+    --update chỉ ghi đè khi bản nguồn có hoạt động mới hơn.
+    """
+    plan = []
+    for c in cands:
+        if from_ and from_ != c["src"] and not c["src_uuid"].startswith(from_):
+            continue
+        if ids and not any(i and i in x for i in ids for x in c["ids"]):
+            continue
+        if c["dst_ts"] is None:
+            plan.append(("copy", c))
+        elif update and c["ts"] > c["dst_ts"]:
+            plan.append(("update", c))
+        else:
+            plan.append(("skip", c))
+    return plan
+
+
+def apply_sync(plan, dst: Path) -> int:
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for act, c in plan:
+        if act != "skip":
+            shutil.copy(c["path"], dst / c["name"])
+            n += 1
     ok(f"Đã gộp {n} session vào tài khoản đang dùng")
     print("    Thoát hẳn Claude Desktop (⌘Q) rồi mở lại để thấy danh sách mới.")
+    return n
+
+
+def cmd_sync_sessions(args=()):
+    opt = {"apply": False, "update": False, "from": "", "ids": []}
+    it = iter(args)
+    for a in it:
+        if a in ("--apply", "--update"):
+            opt[a[2:]] = True
+        elif a in ("--from", "--session"):
+            v = next(it, "")
+            if not v:
+                die(f"{a} cần một giá trị. Xem: claude-switch help")
+            if a == "--from":
+                opt["from"] = v
+            else:
+                opt["ids"].append(v)
+        else:
+            die(f"tuỳ chọn không hợp lệ: {a}. Xem: claude-switch help")
+
+    dst, cands = session_candidates()
+    plan = plan_sync(cands, opt["from"], opt["ids"], opt["update"])
+    marks = {"copy": "+", "update": "~", "skip": "="}
+    for act, c in plan:
+        print("%s %-5s %-38s %-14s %s" % (
+            marks[act], _age(c["ts"]), c["title"][:38], c["src"][:14], c["cwd"]))
+    todo = sum(1 for act, _ in plan if act != "skip")
+    print(f"\n{todo} sẽ gộp, {len(plan) - todo} bỏ qua (+ mới, ~ cập nhật, = đã có).")
+    if not opt["apply"]:
+        print("Chưa ghi gì. Thêm --apply để thực hiện.")
+    elif todo:
+        apply_sync(plan, dst)
+
+
+# --- ui: màn hình tương tác dạng menu — mọi chức năng hiện ra để chọn ---
+MENU = [  # (phím tắt, nhãn, mô tả, hành động)
+    ("1", "Chuyển tài khoản", "chọn profile rồi chuyển", "switch"),
+    ("2", "Tài khoản kế tiếp", "chuyển vòng tròn sang profile sau", "next"),
+    ("3", "Lưu tài khoản hiện tại", "thành profile mới hoặc cập nhật", "save"),
+    ("4", "Quota & usage", "5H / 7 ngày của mọi profile", "usage"),
+    ("5", "Đồng bộ session", "gộp sidebar Desktop, chọn từng cái", "sync"),
+    ("6", "Xoá profile", "chọn profile cần xoá", "remove"),
+    ("7", "Kiểm tra cấu hình", "quyền file, biến ghi đè, profile hỏng", "doctor"),
+    ("8", "Trợ giúp", "phím tắt và cách hoạt động", "help"),
+    ("q", "Thoát", "", "quit"),
+]
+
+HELP_LINES = [
+    "Điều hướng",
+    "  ↑ ↓ / j k    chọn                  Enter   mở / xác nhận",
+    "  1-8          mở mục theo số        Esc     quay lại (ở menu chính: thoát)",
+    "  chuột        bấm vào mục hoặc gợi ý phím ở chân màn hình; cuộn bằng bánh xe",
+    "",
+    "Trong danh sách profile:   Enter chuyển · d xoá · s lưu tài khoản hiện tại",
+    "Trong danh sách session:   Space đánh dấu · a chọn tất cả · Enter gộp",
+    "",
+    "Quota của profile đang dùng đọc trực tiếp từ ~/.claude.json;",
+    "các profile khác là snapshot lúc chúng được lưu.",
+    "Sau khi chuyển phải thoát và mở lại Claude Code.",
+    "Bật chuột chặn bôi đen văn bản — giữ Shift (Option trên macOS) để bôi đen.",
+]
+
+
+def load_rows() -> list:
+    """Mọi profile kèm quota, cho TUI. Profile hỏng bị bỏ qua thay vì làm sập màn hình."""
+    cur, live = current_profile(), load_config().get("cachedUsageUtilization")
+    rows = []
+    for n in profile_names():
+        try:
+            p = json.loads((ACC_DIR / f"{n}.json").read_text())
+        except Exception:
+            continue
+        usage, saved = p.get("usage"), p.get("savedAt")
+        is_live = n == cur and bool(live)
+        if is_live:  # tài khoản đang dùng: số trong ~/.claude.json mới hơn snapshot
+            usage = live
+        a = p.get("oauthAccount", {})
+        rows.append({
+            "name": n, "cur": n == cur,
+            "email": a.get("emailAddress", "?"),
+            "org": a.get("organizationName") or a.get("billingType") or "",
+            "usage": (usage or {}).get("utilization") or {}, "saved": saved, "live": is_live,
+        })
+    return rows
+
+
+def run_quiet(fn, *args, raw=False):
+    """Chạy một cmd_* của CLI mà không để nó in ra màn hình hay thoát process.
+
+    Trả về (thành công?, các dòng output). Mặc định bỏ tiền tố [OK]/[ERROR] để hiện trong
+    khu thông báo; raw=True giữ nguyên để tô màu theo mức (màn hình doctor).
+    """
+    buf, good = io.StringIO(), True
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            with lock():
+                fn(*args)
+        except SystemExit as e:  # die()
+            good = not e.code
+        except Exception as e:
+            good = False
+            print(f"[ERROR] {e}")
+    lines = [l.rstrip() for l in buf.getvalue().splitlines()]
+    if raw:
+        return good, lines
+    return good, [re.sub(r"^\[[^\]]*\]\s*", "", l.strip()) for l in lines if l.strip()]
+
+
+def _age(ts) -> str:
+    if not ts:
+        return "?"
+    s = max(0, time.time() - ts)
+    return "%dm" % (s / 60) if s < 3600 else "%dh" % (s / 3600) if s < 172800 else "%dd" % (s / 86400)
+
+
+def _resets(u: dict) -> str:
+    r = (u.get("seven_day") or {}).get("resets_at")
+    try:
+        return datetime.fromisoformat(r).astimezone().strftime("%d/%m %H:%M")
+    except Exception:
+        return ""
+
+
+def _cursor(visible: bool):
+    try:  # một số terminal (TERM=dumb) không hỗ trợ ẩn/hiện con trỏ
+        curses.curs_set(1 if visible else 0)
+    except curses.error:
+        pass
+
+
+def _ui(scr):
+    _cursor(False)
+    colors = {k: 0 for k in ("ok", "warn", "bad", "accent")}
+    if curses.has_colors() and not os.environ.get("NO_COLOR"):
+        curses.start_color()
+        curses.use_default_colors()
+        for i, (k, c) in enumerate((("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW),
+                                    ("bad", curses.COLOR_RED), ("accent", curses.COLOR_CYAN)), 1):
+            curses.init_pair(i, c, -1)
+            colors[k] = curses.color_pair(i)
+    else:  # không màu: vẫn phân biệt mức độ bằng độ đậm
+        colors["warn"] = colors["bad"] = curses.A_BOLD
+    try:  # chuột: bấm mục menu / gợi ý phím. mouseinterval(0) để nhận ngay lúc nhấn
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+    utf = "utf" in locale.getpreferredencoding(False).lower()
+    FULL, EMPTY, DOT, OFF, ARROW, LOGO = (
+        ("█", "░", "●", "○", "▸", "⇄") if utf else ("#", "-", "*", "o", ">", "<>"))
+    BOLD, DIM, REV = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
+
+    # hits: vùng bấm chuột của khung hình hiện tại, [(y, x0, x1, giá trị trả về từ getkey)]
+    S = {"rows": load_rows(), "sel": 0, "top": 0, "msel": 0, "msg": (True, []),
+         "prompt": None, "hits": [], "draw": None}
+    TITLES = {"switch": "Chuyển tài khoản", "remove": "Xoá profile", "usage": "Quota & usage"}
+    HINTS = {
+        "switch": [("↑↓", "chọn", None), ("⏎", "chuyển", "\n"), ("s", "lưu", "s"),
+                   ("d", "xoá", "d"), ("esc", "quay lại", "\x1b")],
+        "remove": [("↑↓", "chọn", None), ("⏎", "xoá", "\n"), ("esc", "quay lại", "\x1b")],
+        "usage": [("↑↓", "chọn", None), ("esc", "quay lại", "\x1b")],
+    }
+    HOME_HINTS = [("↑↓", "chọn", None), ("1-8", "mở nhanh", None), ("⏎", "mở", "\n"),
+                  ("?", "trợ giúp", "?"), ("q", "thoát", "q")]
+
+    def put(y, x, text, attr=0):
+        h, w = scr.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            try:
+                # ô góc phải dưới ném curses.error nếu ghi kín dòng cuối
+                scr.addstr(y, x, text[: w - x - (y == h - 1)], attr)
+            except curses.error:
+                pass
+
+    def fit(text, w):
+        return (text if len(text) <= w else text[: w - 1] + "…").ljust(w)
+
+    def rule(y, w):
+        put(y, 0, ("─" if utf else "-") * w, DIM)
+
+    def center(y, w, parts):
+        """Căn giữa một dòng gồm nhiều đoạn [(text, attr)]."""
+        x = max(0, (w - sum(len(t) for t, _ in parts)) // 2)
+        for t, a in parts:
+            put(y, x, t, a)
+            x += len(t)
+
+    def quota(u, key):
+        p = (u.get(key) or {}).get("utilization")
+        if p is None:
+            return "?".ljust(11), 0
+        n = round(min(p, 100) / 100 * 6)
+        attr = colors["ok"] if p < 60 else colors["warn"] if p < 85 else colors["bad"]
+        return FULL * n + EMPTY * (6 - n) + " %3d%%" % p, attr
+
+    def frame(min_h=9, min_w=48):
+        """Xoá màn hình + vùng bấm chuột; trả về (H, W), hoặc None nếu terminal quá nhỏ."""
+        scr.erase()
+        S["hits"] = []
+        h, w = scr.getmaxyx()
+        if h < min_h or w < min_w:
+            put(0, 0, f"Terminal quá nhỏ (cần ≥ {min_w}x{min_h})")
+            scr.refresh()
+            return None
+        return h, w
+
+    def footer(h, hints):
+        x = 1
+        for key, label, val in hints:
+            put(h - 1, x, key, colors["accent"] | BOLD)
+            put(h - 1, x + len(key) + 1, label, DIM)
+            w = len(key) + 1 + len(label)
+            if val is not None:
+                S["hits"].append((h - 1, x, x + w, val))
+            x += w + 3
+
+    def bottom(h, w, hints):
+        """Phần chân chung: vạch kẻ, câu hỏi/thông báo (2 dòng), gợi ý phím."""
+        rule(h - 4, w)
+        cursor = False
+        if S["prompt"]:
+            text, buf = S["prompt"]
+            put(h - 3, 1, text + (buf or ""), colors["warn"] | BOLD)
+            if buf is not None:
+                scr.move(h - 3, min(w - 1, 1 + len(text) + len(buf)))
+                cursor = True
+        else:
+            good, lines = S["msg"]
+            for i, line in enumerate(lines[-2:]):
+                mark = ("✔ " if good else "✘ ") if i == 0 and utf else "  "
+                put(h - 3 + i, 1, mark + line, colors["ok" if good else "bad"] if i == 0 else DIM)
+        footer(h, hints)
+        _cursor(cursor)
+        scr.refresh()
+
+    def draw_home():
+        f = frame(15, 48)
+        if not f:
+            return
+        h, w = f
+        rows = S["rows"]
+        cur = next((r for r in rows if r["cur"]), None)
+        avail = h - 4
+        compact = avail < 15
+        total = (1 if compact else 2) + (0 if compact else 1) + (1 if compact else 2) \
+            + (0 if compact else 1) + len(MENU)
+        y = max(0, (avail - total) // 2)
+
+        center(y, w, [(f"{LOGO}  claude-switch", colors["accent"] | BOLD)])
+        y += 1
+        if not compact:
+            center(y, w, [(f"chuyển đổi nhiều tài khoản Claude Code · v{VERSION}", DIM)])
+            y += 2
+        if cur:
+            center(y, w, [(f"{DOT} {cur['name']}", colors["ok"] | BOLD), (f"  ·  {cur['email']}", 0)])
+            if not compact:
+                q5, a5 = quota(cur["usage"], "five_hour")
+                q7, a7 = quota(cur["usage"], "seven_day")
+                center(y + 1, w, [("5H ", DIM), (q5, a5), ("    7D ", DIM), (q7, a7)])
+        elif current_uuid():
+            center(y, w, [(f"{OFF} tài khoản đang đăng nhập chưa được lưu", colors["warn"] | BOLD)])
+            if not compact:
+                center(y + 1, w, [("chọn «Lưu tài khoản hiện tại» để giữ lại", DIM)])
+        else:
+            center(y, w, [(f"{OFF} chưa đăng nhập", DIM)])
+            if not compact:
+                center(y + 1, w, [("chạy `claude` để đăng nhập, rồi mở lại claude-switch", DIM)])
+        y += 1 if compact else 3
+
+        mw = min(w - 4, 70)
+        x0 = (w - mw) // 2
+        for i, (key, label, desc, _) in enumerate(MENU):
+            yy, sel = y + i, i == S["msel"]
+            base = REV if sel else 0
+            if sel:
+                put(yy, x0, " " * mw, base)
+            put(yy, x0 + 1, ARROW if sel else " ", base | colors["accent"])
+            put(yy, x0 + 3, key, base | colors["accent"] | BOLD)
+            put(yy, x0 + 6, fit(label, 24), base | (BOLD if sel else 0))
+            if mw >= 52:
+                put(yy, x0 + 31, fit(desc, mw - 32), base | DIM)
+            S["hits"].append((yy, x0, x0 + mw, key))
+        bottom(h, w, HOME_HINTS)
+
+    def draw_table(mode):
+        f = frame()
+        if not f:
+            return
+        h, w = f
+        rows = S["rows"]
+        cur = next((r for r in rows if r["cur"]), None)
+        put(0, 1, TITLES[mode], colors["accent"] | BOLD)
+        if cur:
+            who, attr = f"{DOT} {cur['name']} ", colors["ok"] | BOLD
+        elif current_uuid():
+            who, attr = f"{OFF} tài khoản chưa lưu ", colors["warn"]
+        else:
+            who, attr = f"{OFF} chưa đăng nhập ", DIM
+        put(0, w - len(who), who, attr)
+        rule(1, w)
+
+        # Cột bỏ dần từ phải sang khi terminal hẹp; email rồi tên co lại sau cùng.
+        nw = min(16, max([7] + [len(r["name"]) for r in rows]))
+        ew = min(30, max([8] + [len(r["email"]) for r in rows]))
+        ow = min(22, max([3] + [len(r["org"]) for r in rows]))
+        cols = [["org", ow], ["saved", 5], ["reset", 11]]
+        width = lambda: 3 + nw + 1 + ew + 1 + 24 + sum(c + 1 for _, c in cols)
+        while cols and width() > w - 1:
+            cols.pop(0)
+        over = width() - (w - 1)
+        if over > 0:
+            cut = min(over, ew - 10)
+            ew, over = ew - cut, over - cut
+            nw = max(7, nw - over)
+        shown = {k for k, _ in cols}
+
+        x = 3
+        for label, cw, on in (("PROFILE", nw, 1), ("EMAIL", ew, 1), ("ORG", ow, "org" in shown),
+                              ("5H", 12, 1), ("7D", 12, 1), ("7D RESET", 11, "reset" in shown),
+                              ("SAVED", 5, "saved" in shown)):
+            if on:
+                put(2, x, label, DIM | BOLD)
+                x += cw + 1
+
+        vis = h - 7
+        S["sel"] = max(0, min(S["sel"], len(rows) - 1))
+        S["top"] = max(0, min(S["top"], S["sel"]), S["sel"] - vis + 1)
+        if not rows:
+            put(4, 3, "Chưa có profile. Về menu chính → «Lưu tài khoản hiện tại»." if current_uuid()
+                else "Chưa đăng nhập. Chạy `claude` để đăng nhập, rồi mở lại claude-switch.", DIM)
+        for i, r in enumerate(rows[S["top"]: S["top"] + vis]):
+            y, sel = 3 + i, S["top"] + i == S["sel"]
+            base = REV if sel else 0
+            if sel:
+                put(y, 0, " " * w, base)
+            S["hits"].append((y, 0, w, ("row", S["top"] + i)))
+            put(y, 1, ARROW if sel else " ", base | colors["accent"])
+            put(y, 2, DOT if r["cur"] else " ", base | colors["ok"])
+            x = 3
+            put(y, x, fit(r["name"], nw), base | (BOLD if r["cur"] else 0))
+            x += nw + 1
+            put(y, x, fit(r["email"], ew), base)
+            x += ew + 1
+            if "org" in shown:
+                put(y, x, fit(r["org"], ow), base | DIM)
+                x += ow + 1
+            for key in ("five_hour", "seven_day"):
+                text, qa = quota(r["usage"], key)
+                put(y, x, text, base | qa)
+                x += 12
+            if "reset" in shown:
+                put(y, x, fit(_resets(r["usage"]), 11), base | DIM)
+                x += 12
+            if "saved" in shown:
+                put(y, x, fit("live" if r["live"] else _age(r["saved"]), 5), base | DIM)
+        bottom(h, w, HINTS[mode])
+
+    def getkey():
+        """Phím, hoặc giá trị của vùng được bấm chuột (xem S['hits']); bánh xe → ↑/↓."""
+        while True:
+            try:
+                k = scr.get_wch()
+            except curses.error:
+                continue
+            if k != curses.KEY_MOUSE:
+                return k
+            try:
+                _, mx, my, _, b = curses.getmouse()
+            except curses.error:
+                continue
+            if b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                for y, x0, x1, val in S["hits"]:
+                    if y == my and x0 <= mx < x1:
+                        return val
+            elif b & getattr(curses, "BUTTON4_PRESSED", 0):
+                return curses.KEY_UP
+            elif b & getattr(curses, "BUTTON5_PRESSED", 0):
+                return curses.KEY_DOWN
+
+    def confirm(text, keys):
+        """Hiện câu hỏi, trả về phím hợp lệ (chữ thường) hoặc None nếu Esc."""
+        S["prompt"] = (text, None)
+        try:
+            while True:
+                S["draw"]()
+                k = getkey()
+                if k == "\x1b":
+                    return None
+                if isinstance(k, str) and k.lower() in keys:
+                    return k.lower()
+        finally:
+            S["prompt"] = None
+
+    def ask(text):
+        """Ô nhập một dòng; trả về chuỗi hoặc None nếu Esc."""
+        buf = ""
+        try:
+            while True:
+                S["prompt"] = (text, buf)
+                S["draw"]()
+                k = getkey()
+                if k == "\x1b":
+                    return None
+                if k in ("\n", "\r", curses.KEY_ENTER):
+                    return buf.strip()
+                if k in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    buf = buf[:-1]
+                elif isinstance(k, str) and k.isprintable():
+                    buf += k
+        finally:
+            S["prompt"] = None
+
+    def say(good, lines):
+        S["msg"] = (good, lines)
+        S["rows"] = load_rows()
+
+    def do_save() -> bool:
+        name = ask("Tên profile (để trống = lấy từ email): ")
+        if name is None:
+            return False
+        if name and not NAME_RE.match(name):
+            say(False, [f"Tên không hợp lệ: '{name}' (chỉ cho phép chữ, số, . _ -)"])
+            return False
+        name = name or name_from_email(load_config())
+        target = ACC_DIR / f"{name}.json"
+        if name and target.exists():
+            try:
+                same = json.loads(target.read_text()).get("oauthAccount", {}).get("accountUuid") == current_uuid()
+            except Exception:
+                same = False
+            if not same and confirm(f"Profile '{name}' đang là tài khoản khác. Ghi đè? [y/N] ", "yn") != "y":
+                return False
+        good, lines = run_quiet(cmd_save, name)
+        say(good, lines)
+        return good
+
+    def guard() -> bool:
+        """Tài khoản đang đăng nhập chưa lưu thì hỏi trước khi rời đi (switch sẽ bỏ nó)."""
+        if current_uuid() and not current_profile():
+            k = confirm("Tài khoản đang đăng nhập chưa lưu.  [s] lưu rồi chuyển  [c] chuyển luôn  [Esc] huỷ ", "sc")
+            if k is None or (k == "s" and not do_save()):
+                return False
+        return True
+
+    def do_switch(name) -> bool:
+        if not guard():
+            return False
+        say(*run_quiet(cmd_use, name))
+        return True
+
+    def do_remove(name):
+        if confirm(f"Xoá profile '{name}'? [y/N] ", "yn") == "y":
+            say(*run_quiet(cmd_remove, name))
+
+    def pick_profile(mode):
+        """Danh sách profile cho 3 chế độ: switch (Enter chuyển), remove (Enter xoá), usage (chỉ xem)."""
+        S["sel"] = next((i for i, r in enumerate(S["rows"]) if r["cur"]), 0) if mode == "switch" else 0
+        while True:
+            S["draw"] = lambda: draw_table(mode)
+            S["draw"]()
+            k = getkey()
+            rows, n = S["rows"], len(S["rows"])
+            if isinstance(k, tuple):  # bấm dòng: lần đầu chọn, bấm lại dòng đang chọn thì thực hiện
+                if k[1] != S["sel"]:
+                    S["sel"] = k[1]
+                    continue
+                k = "\n"
+            if k in ("q", "\x1b"):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                S["sel"] = max(0, S["sel"] - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                S["sel"] = min(n - 1, S["sel"] + 1)
+            elif k in (curses.KEY_HOME, "g"):
+                S["sel"] = 0
+            elif k in (curses.KEY_END, "G"):
+                S["sel"] = n - 1
+            elif k in ("\n", "\r", curses.KEY_ENTER) and n:
+                if mode == "switch" and do_switch(rows[S["sel"]]["name"]):
+                    return
+                if mode == "remove":
+                    do_remove(rows[S["sel"]]["name"])
+                    if not S["rows"]:
+                        return
+            elif k == "s" and mode == "switch":
+                do_save()
+            elif k == "d" and mode == "switch" and n:
+                do_remove(rows[S["sel"]]["name"])
+
+    def show_text(title, lines):
+        """Màn hình văn bản cuộn được; dòng bắt đầu bằng [OK]/[!]/[ERROR] được tô màu."""
+        top = 0
+        while True:
+            f = frame()
+            if f:
+                h, w = f
+                vis = h - 4
+                top = max(0, min(top, len(lines) - vis))
+                put(0, 1, title, colors["accent"] | BOLD)
+                rule(1, w)
+                for i, line in enumerate(lines[top: top + vis]):
+                    attr = (colors["ok"] if line.startswith("[OK]") else
+                            colors["warn"] if line.startswith("[!]") else
+                            colors["bad"] if line.startswith("[ERROR]") else 0)
+                    put(2 + i, 2, line, attr)
+                rule(h - 2, w)
+                footer(h, [("↑↓", "cuộn", None), ("esc", "quay lại", "\x1b")])
+                scr.refresh()
+            k = getkey()
+            if k in ("\x1b", "q", "\n", "\r", curses.KEY_ENTER):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                top = max(0, top - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                top += 1
+
+    def do_sessions():
+        """Chọn từng session (hoặc tất cả) để gộp về tài khoản đang dùng."""
+        got = {}
+        good, lines = run_quiet(lambda: got.update(v=session_candidates()))
+        if not good:
+            say(False, lines)
+            return
+        dst, cands = got["v"]
+        items = [c for c in cands if c["dst_ts"] is None]
+        if not items:
+            say(True, ["Không có session nào cần gộp"])
+            return
+        chosen, cur_i, top = set(), 0, 0
+        while True:
+            f = frame()
+            if f:
+                h, w = f
+                vis = max(1, h - 4)
+                top = max(0, min(top, cur_i), cur_i - vis + 1)
+                count = f"{len(chosen)}/{len(items)} đã chọn"
+                put(0, 1, "Đồng bộ session về tài khoản đang dùng", colors["accent"] | BOLD)
+                put(0, max(0, w - len(count) - 1), count, DIM)
+                rule(1, w)
+                tw = max(10, w - 40)
+                for i, c in enumerate(items[top: top + vis]):
+                    idx = top + i
+                    base = REV if idx == cur_i else 0
+                    if base:
+                        put(2 + i, 0, " " * w, base)
+                    S["hits"].append((2 + i, 0, w, ("row", idx)))
+                    put(2 + i, 1, ("[x] " if idx in chosen else "[ ] ") + "%-5s" % _age(c["ts"]),
+                        base | (colors["ok"] if idx in chosen else 0))
+                    put(2 + i, 12, fit(c["title"], tw), base)
+                    put(2 + i, 13 + tw, fit(c["src"], 14), base | DIM)
+                rule(h - 2, w)
+                footer(h, [("↑↓", "chọn", None), ("space", "đánh dấu", " "), ("a", "tất cả", "a"),
+                           ("⏎", "gộp", "\n"), ("esc", "quay lại", "\x1b")])
+                scr.refresh()
+            k = getkey()
+            if isinstance(k, tuple):  # bấm dòng = đánh dấu/bỏ đánh dấu
+                cur_i = k[1]
+                k = " "
+            if k in ("\x1b", "q"):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                cur_i = max(0, cur_i - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                cur_i = min(len(items) - 1, cur_i + 1)
+            elif k == " ":
+                chosen ^= {cur_i}
+            elif k == "a":
+                chosen = set() if len(chosen) == len(items) else set(range(len(items)))
+            elif k in ("\n", "\r", curses.KEY_ENTER):
+                # chưa đánh dấu gì thì gộp đúng dòng đang chọn
+                plan = [("copy", items[i]) for i in sorted(chosen or {cur_i})]
+                say(*run_quiet(apply_sync, plan, dst))
+                return
+
+    def act(action) -> bool:
+        """Chạy một mục menu. Trả về True nếu là Thoát."""
+        if action == "quit":
+            return True
+        S["msg"] = (True, [])
+        if action in ("switch", "usage", "remove"):
+            pick_profile(action)
+        elif action == "next":
+            if guard():
+                say(*run_quiet(cmd_next))
+        elif action == "save":
+            do_save()
+        elif action == "sync":
+            do_sessions()
+        elif action == "doctor":
+            show_text("Kiểm tra cấu hình", run_quiet(cmd_doctor, raw=True)[1])
+        elif action == "help":
+            show_text("Trợ giúp", HELP_LINES)
+        S["rows"] = load_rows()
+        return False
+
+    while True:  # menu chính
+        S["draw"] = draw_home
+        draw_home()
+        k = getkey()
+        if k in ("q", "\x1b"):
+            return
+        elif k in (curses.KEY_UP, "k"):
+            S["msel"] = (S["msel"] - 1) % len(MENU)
+        elif k in (curses.KEY_DOWN, "j"):
+            S["msel"] = (S["msel"] + 1) % len(MENU)
+        elif k == "?":
+            act("help")
+        elif k in ("\n", "\r", curses.KEY_ENTER):
+            if act(MENU[S["msel"]][3]):
+                return
+        elif isinstance(k, str) and k in "12345678":
+            S["msel"] = int(k) - 1
+            if act(MENU[S["msel"]][3]):
+                return
+
+
+def cmd_ui():
+    if curses is None:
+        die("TUI cần module curses (Windows chưa hỗ trợ). Dùng lệnh CLI: claude-switch help")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("TUI cần terminal tương tác. Dùng lệnh CLI: claude-switch help")
+    locale.setlocale(locale.LC_ALL, "")  # không có thì curses làm hỏng ký tự có dấu
+    os.environ.setdefault("ESCDELAY", "25")  # mặc định chờ 1s mới nhận Esc
+    try:
+        curses.wrapper(_ui)
+    except KeyboardInterrupt:
+        pass
 
 
 def cmd_help():
     print(f"""claude-switch {VERSION} — chuyển đổi nhiều tài khoản Claude Code
+
+  claude-switch               Mở màn hình tương tác (TUI) — trong terminal
+  claude-switch ui            Như trên, gọi tường minh
 
   claude-switch save [name]   Lưu tài khoản đang đăng nhập (bỏ trống name → lấy từ email)
   claude-switch <name>        Chuyển sang tài khoản đã lưu
@@ -355,7 +1122,11 @@ def cmd_help():
   claude-switch usage         Bảng quota 5h / 7 ngày của mọi profile
   claude-switch next          Chuyển sang profile kế tiếp (vòng tròn)
   claude-switch remove <name> Xoá profile
-  claude-switch sync-sessions Gộp danh sách session Desktop của mọi account về account đang dùng
+  claude-switch sync-sessions Xem trước session Desktop của account khác (thêm --apply để gộp)
+        --session <id>  chỉ session có id/tên file chứa chuỗi này (lặp được)
+        --from <name>   chỉ session của profile/accountUuid này
+        --update        ghi đè khi bản nguồn có hoạt động mới hơn
+  claude-switch doctor        Kiểm tra cấu hình, quyền file, biến môi trường ghi đè
   claude-switch version       In phiên bản
 
 Profile lưu ở ~/.claude-accounts (chmod 700, file 600) và CHỨA REFRESH TOKEN —
@@ -364,16 +1135,14 @@ Profile lưu ở ~/.claude-accounts (chmod 700, file 600) và CHỨA REFRESH TOK
 Sau khi switch phải thoát và mở lại Claude Code; phiên đang chạy giữ token trong RAM.""")
 
 
-def main():
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(ACC_DIR, 0o700)
-    os.chmod(BACKUP_DIR, 0o700)
+READ_ONLY = {"ui", "list", "ls", "status", "current", "usage", "doctor",
+             "version", "-v", "--version", "help", "-h", "--help"}
 
-    argv = sys.argv[1:] or ["help"]
-    cmd, args = argv[0], argv[1:]
-    arg = args[0] if args else ""
 
-    if cmd == "save":
+def dispatch(cmd, args, arg):
+    if cmd == "ui":
+        cmd_ui()
+    elif cmd == "save":
         cmd_save(arg)
     elif cmd == "use":
         cmd_use(arg)
@@ -383,18 +1152,37 @@ def main():
         cmd_status()
     elif cmd == "usage":
         cmd_usage()
+    elif cmd == "doctor":
+        cmd_doctor()
     elif cmd == "next":
         cmd_next()
     elif cmd in ("remove", "rm"):
         cmd_remove(arg)
     elif cmd == "sync-sessions":
-        cmd_sync_sessions()
+        cmd_sync_sessions(args)
     elif cmd in ("version", "-v", "--version"):
         print(VERSION)
     elif cmd in ("help", "-h", "--help"):
         cmd_help()
     else:
         cmd_use(cmd)  # `claude-switch work` = `claude-switch use work`
+
+
+def main():
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(ACC_DIR, 0o700)
+    os.chmod(BACKUP_DIR, 0o700)
+
+    # Không đối số: TUI nếu có terminal, ngược lại (pipe, script) in help như trước.
+    argv = sys.argv[1:] or (["ui"] if sys.stdin.isatty() and sys.stdout.isatty() and curses else ["help"])
+    cmd, args = argv[0], argv[1:]
+    arg = args[0] if args else ""
+
+    if cmd in READ_ONLY:
+        dispatch(cmd, args, arg)
+    else:
+        with lock():
+            dispatch(cmd, args, arg)
 
 
 if __name__ == "__main__":

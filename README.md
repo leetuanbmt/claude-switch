@@ -9,7 +9,7 @@
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-lightgrey">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen">
-  <img alt="tests" src="https://img.shields.io/badge/tests-14%2F14-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-29%2F29-brightgreen">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
@@ -41,10 +41,51 @@ claude-switch work            # chuyển sang
 
 Sau khi switch phải **thoát và mở lại Claude Code** — phiên đang chạy giữ token trong RAM.
 
+## Giao diện tương tác
+
+Chạy `claude-switch` không đối số trong terminal để mở menu toàn màn hình. Mọi chức
+năng hiện ra để chọn, mỗi mục mở một màn hình riêng, `Esc` quay lại. Chạy qua pipe hoặc
+script thì vẫn in help như trước. Dùng `curses` của stdlib nên không thêm dependency
+(Windows không có `curses` — dùng lệnh CLI).
+
+```
+                    ⇄  claude-switch
+      chuyển đổi nhiều tài khoản Claude Code · v1.0.0
+
+              ● work  ·  me@company.com
+           5H ██░░░░  33%    7D ██░░░░  41%
+
+        ▸ 1  Chuyển tài khoản         chọn profile rồi chuyển
+          2  Tài khoản kế tiếp        chuyển vòng tròn sang profile sau
+          3  Lưu tài khoản hiện tại    thành profile mới hoặc cập nhật
+          4  Quota & usage             5H / 7 ngày của mọi profile
+          5  Đồng bộ session           gộp sidebar Desktop, chọn từng cái
+          6  Xoá profile               chọn profile cần xoá
+          7  Kiểm tra cấu hình         quyền file, biến ghi đè, profile hỏng
+          8  Trợ giúp                  phím tắt và cách hoạt động
+          q  Thoát
+```
+
+| Thao tác | Việc |
+|---|---|
+| `↑` `↓` / `j` `k` | Chọn |
+| `Enter` | Mở mục / xác nhận |
+| `1`–`8` | Mở thẳng mục theo số |
+| `Esc` | Quay lại (ở menu chính: thoát) |
+| Chuột | Bấm vào mục menu hoặc gợi ý phím ở chân màn hình; cuộn bằng bánh xe |
+
+Trong danh sách profile: `Enter` chuyển, `d` xoá, `s` lưu tài khoản hiện tại. Trong danh
+sách session: `Space` đánh dấu, `a` chọn tất cả, `Enter` gộp. Nếu tài khoản đang đăng
+nhập chưa được lưu, chuyển profile sẽ hỏi lưu trước thay vì âm thầm bỏ nó. Bật chuột chặn
+bôi đen văn bản — giữ `Shift` (`Option` trên macOS) để bôi đen. Cần terminal tối thiểu
+48×15.
+
 ## Lệnh
 
 | Lệnh | Việc nó làm |
 |---|---|
+| `ui` | Mở màn hình tương tác (giống chạy không đối số). |
+| `doctor` | Kiểm tra quyền file, profile hỏng/trùng, biến môi trường ghi đè (`ANTHROPIC_API_KEY`…), tài khoản chưa lưu. |
 | `save [name]` | Lưu tài khoản đang đăng nhập thành profile. Bỏ trống `name` thì lấy phần trước `@` của email. |
 | `<name>` | Chuyển sang profile đó (viết tắt của `use <name>`). |
 | `list` | Danh sách profile, `*` đánh dấu cái đang dùng. |
@@ -52,7 +93,7 @@ Sau khi switch phải **thoát và mở lại Claude Code** — phiên đang ch�
 | `usage` | Bảng quota 5h / 7 ngày của mọi profile. |
 | `next` | Chuyển sang profile kế tiếp theo vòng tròn. |
 | `remove <name>` | Xoá profile (tài khoản trên server không bị ảnh hưởng). |
-| `sync-sessions` | Gộp sidebar session của Claude Desktop về tài khoản đang dùng. |
+| `sync-sessions` | Xem trước, rồi gộp sidebar session của Claude Desktop về tài khoản đang dùng. Xem mục bên dưới. |
 | `version` | Phiên bản, đọc từ file `VERSION`. |
 
 ```console
@@ -62,15 +103,16 @@ $ claude-switch list
   client         me@client.io                     Client Co
 
 $ claude-switch usage
-PROFILE        EMAIL                        5H     7D     SNAPSHOT
-personal       me@gmail.com                   ?      ?    70h trước
-work           me@company.com                12%    41%   2h trước   reset 29/08 21:59
-client         me@client.io                   0%     3%   111h trước reset 30/08 08:30
+PROFILE        EMAIL                        5H     7D     NGUỒN
+personal       me@gmail.com                   ?      ?    2d
+work           me@company.com                12%    41%   live   reset 29/08 21:59
+client         me@client.io                   0%     3%   4d     reset 30/08 08:30
 ```
 
-Số liệu `usage` là snapshot lúc profile được lưu, tự cập nhật mỗi lần switch — nên
-không phải đăng nhập từng tài khoản chỉ để xem còn bao nhiêu quota. Muốn số realtime
-của tài khoản đang dùng thì `claude` → `/usage`.
+Cột `NGUỒN`: `live` là tài khoản đang dùng (đọc thẳng từ `~/.claude.json`), còn lại là
+snapshot lúc profile được lưu, kèm tuổi — tự cập nhật mỗi lần switch, nên không phải
+đăng nhập từng tài khoản chỉ để xem còn bao nhiêu quota. Muốn số realtime thì
+`claude` → `/usage`.
 
 ## Cách hoạt động
 
@@ -100,7 +142,18 @@ cho mọi tài khoản. Nhưng Claude Desktop lưu metadata để dựng sidebar
 Desktop chỉ đọc **đúng một** thư mục — của account **và** org đang đăng nhập. Đổi tài
 khoản là sidebar trống, dù transcript còn nguyên vẹn.
 
-`sync-sessions` copy mọi `local_*.json` từ các thư mục khác vào thư mục đang active:
+`sync-sessions` copy `local_*.json` từ các thư mục khác vào thư mục đang active. **Mặc định
+chỉ xem trước** (`+` mới, `~` cập nhật, `=` đã có) và không ghi gì cho tới khi có `--apply`:
+
+```bash
+claude-switch sync-sessions                         # xem trước toàn bộ
+claude-switch sync-sessions --apply                 # gộp toàn bộ
+claude-switch sync-sessions --session abc123 --apply  # chỉ session có id/tên file chứa "abc123"
+claude-switch sync-sessions --from work --apply     # chỉ session của profile "work"
+claude-switch sync-sessions --update --apply        # ghi đè khi bản nguồn có hoạt động mới hơn
+```
+
+Trong TUI, phím `y` cho chọn từng session theo tên và thời gian. Quy tắc:
 
 - **Đổi cả `orgUuid`**, không giữ org gốc. Giữ nguyên thì file rơi vào thư mục Desktop
   không bao giờ đọc tới.
@@ -144,11 +197,11 @@ cần gọi thẳng Security.framework.
 ## Phát triển
 
 ```bash
-./test.sh    # 14 checks
+./test.sh    # 29 checks
 ```
 
 Test dựng một `$HOME` tạm và ép backend credential dạng file, nên Keychain thật không
-bao giờ bị ghi và tài khoản thật không bị đụng tới. `CLAUDE_SESSIONS_DIR` cũng trỏ vào
+bao giờ bị ghi và tài khoản thật không bị đụng tới. Phần TUI chạy qua một pty thật. `CLAUDE_SESSIONS_DIR` cũng trỏ vào
 sandbox nên bộ test chạy như nhau trên mọi OS.
 
 ```
