@@ -1,24 +1,30 @@
-<h1 align="center">claude-switch</h1>
+<h1 align="center">agents-switch</h1>
 
 <p align="center">
-  Chuyển đổi nhiều tài khoản Claude Code mà không phải đăng nhập lại.<br>
-  Một file Python, chỉ dùng stdlib.
+  Chuyển đổi đa tài khoản cho các AI Coding Agents (Claude Code, OpenAI Codex) mà không phải đăng nhập lại.<br>
+  Tham khảo cơ chế từ <a href="https://github.com/loongphy/codex-auth">codex-auth</a> cho OpenAI Codex.<br>
+  Một file Python duy nhất, chỉ dùng stdlib.
 </p>
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-lightgrey">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen">
-  <img alt="tests" src="https://img.shields.io/badge/tests-29%2F29-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-53%2F53-brightgreen">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
 ---
 
-Có nhiều tài khoản Claude Code (cá nhân, công ty, team khác) thì mỗi lần đổi phải
-`/login` lại từ đầu. `claude-switch` lưu credential của từng tài khoản thành profile
-và hoán đổi trong chưa tới một giây — giữ nguyên settings, hooks, plugins và toàn bộ
-lịch sử hội thoại.
+Khi làm việc với nhiều tài khoản AI Coding Agents (tài khoản cá nhân, công ty, khách hàng khác nhau), mỗi lần đổi tài khoản bạn thường phải logout và login lại từ đầu rất mất thời gian.
+
+`agents-switch` giải quyết vấn đề này bằng cách lưu trữ credential của từng tài khoản thành các profile riêng biệt và hoán đổi trong chưa tới một giây — giữ nguyên settings, hooks, plugins và lịch sử làm việc.
+
+Công cụ hỗ trợ nhiều AI Agent clients:
+- **Claude Code (`claude`)**: Quản lý OAuth token trong macOS Keychain hoặc `~/.claude/.credentials.json`, `~/.claude.json`, đồng bộ session Claude Desktop, theo dõi snapshot quota 5H/7D.
+- **OpenAI Codex (`codex`)**: Tham khảo từ `codex-auth`, quản lý `~/.codex/auth.json`, tự động giải mã JWT để lấy email/plan/account_id, hỗ trợ chuyển nhanh tài khoản trước đó (`switch -`), quản lý alias, export/import, tương thích Codex CLI, VS Code extension và Codex App.
+
+---
 
 ## Cài đặt
 
@@ -27,190 +33,158 @@ git clone https://github.com/leetuanbmt/claude-switch.git
 cd claude-switch && ./install.sh
 ```
 
-Symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`,
-`/opt/homebrew/bin`). Yêu cầu duy nhất là `python3` — macOS và Ubuntu cài sẵn.
+Script sẽ tự động tạo symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`):
+- `agents-switch`: Hub trung tâm quản lý đa client.
+- `claude-switch`: Lệnh tắt tương thích ngược chuyên cho Claude Code.
+- `codex-switch`: Lệnh tắt chuyên cho OpenAI Codex.
 
-## Bắt đầu
+Yêu cầu duy nhất là `python3` (3.8+) — có sẵn trên macOS và Linux/Ubuntu. Không cần cài thêm bất kỳ package nào.
+
+---
+
+## Bắt đầu nhanh
+
+### 1. Dùng với Claude Code
 
 ```bash
-claude-switch save            # lưu tài khoản đang đăng nhập, tên lấy từ email
-claude                        # /login bằng tài khoản thứ hai
-claude-switch save work       # lưu tiếp, đặt tên tuỳ ý
-claude-switch work            # chuyển sang
+claude-switch save            # Lưu tài khoản Claude đang đăng nhập (tự lấy tên từ email)
+claude                        # Đăng nhập tài khoản Claude thứ 2
+claude-switch save work       # Lưu tiếp với tên 'work'
+claude-switch work            # Chuyển sang tài khoản 'work'
 ```
 
-Sau khi switch phải **thoát và mở lại Claude Code** — phiên đang chạy giữ token trong RAM.
+*Lưu ý: Sau khi switch Claude Code, hãy thoát và mở lại terminal/Claude Code để nhận token mới.*
 
-## Giao diện tương tác
+### 2. Dùng với OpenAI Codex (tham khảo codex-auth)
 
-Chạy `claude-switch` không đối số trong terminal để mở menu toàn màn hình. Mọi chức
-năng hiện ra để chọn, mỗi mục mở một màn hình riêng, `Esc` quay lại. Chạy qua pipe hoặc
-script thì vẫn in help như trước. Dùng `curses` của stdlib nên không thêm dependency
-(Windows không có `curses` — dùng lệnh CLI).
+```bash
+codex-switch save             # Lưu tài khoản Codex hiện tại từ ~/.codex/auth.json
+codex login                   # Đăng nhập tài khoản Codex thứ 2
+codex-switch save openai-work # Lưu với tên 'openai-work'
+codex-switch switch -         # Chuyển đổi nhanh về tài khoản trước đó!
+codex-switch alias set openai-work work  # Gán alias 'work'
+codex-switch switch work      # Chuyển nhanh bằng alias
+```
+
+*Lưu ý: Khởi động lại Codex CLI, VS Code extension hoặc Codex App sau khi switch.*
+
+### 3. Dùng với Hub agents-switch
+
+```bash
+agents-switch clients         # Liệt kê các client được hỗ trợ và trạng thái
+agents-switch status          # Xem tài khoản đang active trên mọi client
+agents-switch doctor          # Kiểm tra cấu hình toàn bộ client
+agents-switch claude list     # Liệt kê profile Claude
+agents-switch codex list      # Liệt kê profile Codex
+```
+
+---
+
+## Giao diện tương tác (TUI)
+
+Chạy `agents-switch` (hoặc `claude-switch`, `codex-switch`) không đối số trong terminal để mở giao diện toàn màn hình:
 
 ```
-                    ⇄  claude-switch
-      chuyển đổi nhiều tài khoản Claude Code · v1.0.0
+                    ⇄  agents-switch
+      chuyển đổi tài khoản AI Coding Agents · v2.0.0
 
+          [ Client: Claude Code ]  (Tab / c: đổi)
               ● work  ·  me@company.com
            5H ██░░░░  33%    7D ██░░░░  41%
 
         ▸ 1  Chuyển tài khoản         chọn profile rồi chuyển
           2  Tài khoản kế tiếp        chuyển vòng tròn sang profile sau
-          3  Lưu tài khoản hiện tại    thành profile mới hoặc cập nhật
-          4  Quota & usage             5H / 7 ngày của mọi profile
-          5  Đồng bộ session           gộp sidebar Desktop, chọn từng cái
-          6  Xoá profile               chọn profile cần xoá
-          7  Kiểm tra cấu hình         quyền file, biến ghi đè, profile hỏng
-          8  Trợ giúp                  phím tắt và cách hoạt động
+          3  Lưu tài khoản hiện tại   thành profile mới hoặc cập nhật
+          4  Quota & usage            5H / 7 ngày của mọi profile
+          5  Đồng bộ session          gộp sidebar Desktop, chọn từng cái
+          6  Xoá profile              chọn profile cần xoá
+          7  Kiểm tra cấu hình        quyền file, biến ghi đè, profile hỏng
+          8  Trợ giúp                 phím tắt và cách hoạt động
+          c  Đổi client               chuyển sang OpenAI Codex
           q  Thoát
 ```
 
-| Thao tác | Việc |
+| Thao tác | Hành động |
 |---|---|
-| `↑` `↓` / `j` `k` | Chọn |
-| `Enter` | Mở mục / xác nhận |
-| `1`–`8` | Mở thẳng mục theo số |
-| `Esc` | Quay lại (ở menu chính: thoát) |
-| Chuột | Bấm vào mục menu hoặc gợi ý phím ở chân màn hình; cuộn bằng bánh xe |
+| `↑` `↓` / `j` `k` | Chọn mục |
+| `Tab` / `c` | **Đổi client làm việc** giữa Claude Code và OpenAI Codex ngay trong TUI |
+| `Enter` | Mở mục / xác nhận chuyển |
+| `1`–`8` | Mở thẳng mục theo số phím tắt |
+| `Esc` | Quay lại màn hình trước |
+| Chuột | Bấm chọn mục, bấm nút hành động chân màn hình, cuộn bằng bánh xe |
 
-Trong danh sách profile: `Enter` chuyển, `d` xoá, `s` lưu tài khoản hiện tại. Trong danh
-sách session: `Space` đánh dấu, `a` chọn tất cả, `Enter` gộp. Nếu tài khoản đang đăng
-nhập chưa được lưu, chuyển profile sẽ hỏi lưu trước thay vì âm thầm bỏ nó. Bật chuột chặn
-bôi đen văn bản — giữ `Shift` (`Option` trên macOS) để bôi đen. Cần terminal tối thiểu
-48×15.
+---
 
-## Lệnh
+## Bảng lệnh CLI
 
-| Lệnh | Việc nó làm |
+### Lệnh toàn cục `agents-switch`
+
+| Lệnh | Mô tả |
 |---|---|
-| `ui` | Mở màn hình tương tác (giống chạy không đối số). |
-| `doctor` | Kiểm tra quyền file, profile hỏng/trùng, biến môi trường ghi đè (`ANTHROPIC_API_KEY`…), tài khoản chưa lưu. |
-| `save [name]` | Lưu tài khoản đang đăng nhập thành profile. Bỏ trống `name` thì lấy phần trước `@` của email. |
-| `<name>` | Chuyển sang profile đó (viết tắt của `use <name>`). |
-| `list` | Danh sách profile, `*` đánh dấu cái đang dùng. |
-| `status` | Tài khoản đang đăng nhập. |
-| `usage` | Bảng quota 5h / 7 ngày của mọi profile. |
-| `next` | Chuyển sang profile kế tiếp theo vòng tròn. |
-| `remove <name>` | Xoá profile (tài khoản trên server không bị ảnh hưởng). |
-| `sync-sessions` | Xem trước, rồi gộp sidebar session của Claude Desktop về tài khoản đang dùng. Xem mục bên dưới. |
-| `version` | Phiên bản, đọc từ file `VERSION`. |
+| `agents-switch` | Mở TUI đa client |
+| `agents-switch clients` | Liệt kê danh sách AI agent clients và trạng thái |
+| `agents-switch client [name]` | Xem hoặc đặt client mặc định (`claude` hoặc `codex`) |
+| `agents-switch status` | Hiển thị tài khoản active trên tất cả clients |
+| `agents-switch doctor` | Kiểm tra toàn diện tất cả clients |
+| `agents-switch <client> <cmd>` | Thực thi lệnh cho client chỉ định (`claude` hoặc `codex`) |
 
+### Lệnh cho Claude Code (`claude-switch` hoặc `agents-switch claude`)
+
+| Lệnh | Mô tả |
+|---|---|
+| `save [name]` | Lưu tài khoản đang đăng nhập thành profile (tự sinh tên nếu bỏ trống) |
+| `<name>` / `use <name>` | Chuyển sang profile đó |
+| `list` | Danh sách profile, `*` đánh dấu tài khoản đang dùng |
+| `status` | Tài khoản đang đăng nhập |
+| `usage` | Bảng quota 5H / 7 ngày của mọi profile |
+| `next` | Chuyển sang profile kế tiếp theo vòng tròn alphabet |
+| `remove <name>` | Xoá profile |
+| `sync-sessions` | Xem trước / gộp danh sách session Claude Desktop về tài khoản active |
+| `doctor` | Kiểm tra quyền file, biến môi trường (`ANTHROPIC_*`), profile hỏng |
+
+### Lệnh cho OpenAI Codex (`codex-switch` hoặc `agents-switch codex`)
+
+| Lệnh | Mô tả |
+|---|---|
+| `save [name]` | Lưu tài khoản từ `~/.codex/auth.json` (tự giải mã JWT lấy email/plan) |
+| `switch <query>` | Chuyển sang profile theo tên, alias hoặc email |
+| `switch -` | **Quay lại tài khoản trước đó** (tính năng từ `codex-auth`) |
+| `list` | Danh sách profile Codex, kèm Alias, Email, Plan, Auth Mode |
+| `status` | Tài khoản Codex đang đăng nhập và gói dịch vụ (Pro, Team, etc.) |
+| `next` | Chuyển sang profile Codex kế tiếp |
+| `alias set <q> <alias>` | Gán alias cho profile để switch nhanh |
+| `alias clear <q>` | Xoá alias của profile |
+| `login [--device-auth]` | Chạy `codex login` rồi tự động lưu profile |
+| `export [dir]` | Xuất các snapshot auth thành file `*.auth.json` |
+| `import <path>` | Nhập file hoặc thư mục `*.auth.json` vào profile |
+| `remove <name>` / `--all` | Xoá profile (hoặc xoá toàn bộ với `--all`) |
+| `doctor` | Kiểm tra cấu hình Codex, quyền file, biến `OPENAI_API_KEY` |
+
+---
+
+## Cách hoạt động & Bảo mật
+
+1. **Phạm vi hoán đổi:**
+   - **Claude Code:** Chỉ hoán đổi OAuth token (Keychain hoặc `~/.claude/.credentials.json`) và 2 key `oauthAccount` + `userID` trong `~/.claude.json`. Giữ nguyên `~/.claude/` (settings, MCP servers, projects, hooks).
+   - **OpenAI Codex:** Hoán đổi file `~/.codex/auth.json`. Hỗ trợ cả ChatGPT Subscription OAuth và OpenAI API Key.
+2. **Bảo mật:**
+   - Thư mục profile `~/.claude-accounts` và `~/.codex-accounts` được bảo vệ với quyền `chmod 700`.
+   - File profile chứa refresh token được bảo vệ với `chmod 600`.
+   - Ghi dữ liệu dạng atomic (`os.replace`) tránh hỏng file khi bị ngắt tiến trình.
+   - Sao lưu tự động (giữ 10 bản gần nhất) vào thư mục `backups/` trước mỗi lần ghi đè.
+   - Khoá file chống xung đột (`fcntl.flock`) khi có nhiều lệnh chạy cùng lúc.
+
+---
+
+## Kiểm thử
+
+Bộ kiểm thử tự động gồm 53 checks bao phủ toàn bộ các tính năng của Claude Code và OpenAI Codex:
+
+```bash
+./test.sh
+```
+
+Kết quả:
 ```console
-$ claude-switch list
-  personal       me@gmail.com                     me@gmail.com's Organization
-* work           me@company.com                   ACME
-  client         me@client.io                     Client Co
-
-$ claude-switch usage
-PROFILE        EMAIL                        5H     7D     NGUỒN
-personal       me@gmail.com                   ?      ?    2d
-work           me@company.com                12%    41%   live   reset 29/08 21:59
-client         me@client.io                   0%     3%   4d     reset 30/08 08:30
+PASS — 53 checks (All Claude Code + OpenAI Codex multi-client tests passed)
 ```
-
-Cột `NGUỒN`: `live` là tài khoản đang dùng (đọc thẳng từ `~/.claude.json`), còn lại là
-snapshot lúc profile được lưu, kèm tuổi — tự cập nhật mỗi lần switch, nên không phải
-đăng nhập từng tài khoản chỉ để xem còn bao nhiêu quota. Muốn số realtime thì
-`claude` → `/usage`.
-
-## Cách hoạt động
-
-Chỉ hoán đổi đúng phần thuộc về *tài khoản*, còn lại thuộc về *máy* nên giữ nguyên:
-
-| Hoán đổi | Giữ nguyên |
-|---|---|
-| OAuth token — macOS Keychain `Claude Code-credentials`, hoặc `~/.claude/.credentials.json` | Toàn bộ `~/.claude/` — settings, `CLAUDE.md`, hooks, plugins, projects |
-| 2 key `oauthAccount` + `userID` trong `~/.claude.json` | Mọi key khác trong `~/.claude.json` — `mcpServers`, `projects`, cache |
-
-Vì lịch sử hội thoại và cấu hình nằm ngoài phạm vi swap, mọi tài khoản dùng chung
-chúng và mỗi lần switch chỉ ghi vài KB.
-
-`~/.claude.json` được backup (giữ 10 bản gần nhất) vào `~/.claude-accounts/backups/`
-trước mỗi lần ghi, và ghi bằng `os.replace` nên không thể để lại file hỏng giữa chừng.
-
-## sync-sessions — vì sao Desktop mất danh sách session
-
-Nội dung hội thoại nằm ở `~/.claude/projects/<cwd-slug>/<sessionId>.jsonl`, dùng chung
-cho mọi tài khoản. Nhưng Claude Desktop lưu metadata để dựng sidebar (title, model,
-`cwd`, `cliSessionId`) ở nơi khác, chia theo tài khoản:
-
-```
-~/Library/Application Support/Claude/claude-code-sessions/<accountUuid>/<orgUuid>/local_*.json
-```
-
-Desktop chỉ đọc **đúng một** thư mục — của account **và** org đang đăng nhập. Đổi tài
-khoản là sidebar trống, dù transcript còn nguyên vẹn.
-
-`sync-sessions` copy `local_*.json` từ các thư mục khác vào thư mục đang active. **Mặc định
-chỉ xem trước** (`+` mới, `~` cập nhật, `=` đã có) và không ghi gì cho tới khi có `--apply`:
-
-```bash
-claude-switch sync-sessions                         # xem trước toàn bộ
-claude-switch sync-sessions --apply                 # gộp toàn bộ
-claude-switch sync-sessions --session abc123 --apply  # chỉ session có id/tên file chứa "abc123"
-claude-switch sync-sessions --from work --apply     # chỉ session của profile "work"
-claude-switch sync-sessions --update --apply        # ghi đè khi bản nguồn có hoạt động mới hơn
-```
-
-Trong TUI, phím `y` cho chọn từng session theo tên và thời gian. Quy tắc:
-
-- **Đổi cả `orgUuid`**, không giữ org gốc. Giữ nguyên thì file rơi vào thư mục Desktop
-  không bao giờ đọc tới.
-- Không ghi đè file trùng tên — bản ở đích mới hơn (`lastFocusedAt`, title đã sửa).
-- Bỏ qua `deleted_*` và `scheduled-tasks.json`.
-
-Chạy xong phải **⌘Q Claude Desktop rồi mở lại**, vì sidebar dựng lúc khởi động. Mỗi
-lần switch sang account hoặc org khác thì chạy lại, do thư mục đích đổi theo org.
-
-> **Giới hạn:** lệnh chỉ *di chuyển* danh sách đã có, không *tạo* mục mới. Session chạy
-> bằng `claude` trong terminal chưa bao giờ có `local_*.json` nên Desktop không liệt kê.
-> Từ CLI thì không cần lệnh này — `cd <project> && claude --resume <sessionId>` luôn thấy
-> đủ session.
-
-## Nền tảng
-
-| | Credential | Sidebar Desktop | Trạng thái |
-|---|---|---|---|
-| macOS | Keychain `Claude Code-credentials` | `~/Library/Application Support/Claude/…` | Đã test (macOS 26) |
-| Linux / WSL | `~/.claude/.credentials.json` | `~/.config/Claude/…` | Đã test (Ubuntu 24.04, Python 3.12) |
-| Windows | `~/.claude/.credentials.json` | `%APPDATA%/Claude/…` | Chưa hỗ trợ — dùng WSL |
-
-Đặt `CLAUDE_SESSIONS_DIR` nếu Claude Desktop cài ở đường dẫn khác mặc định.
-
-Windows chưa hỗ trợ vì hai lý do: chưa xác minh Claude Code bản Windows lưu OAuth
-token ở file hay Credential Manager, và `chmod 600` vô hiệu trên NTFS nên refresh
-token sẽ nằm không có bảo vệ quyền file.
-
-## Bảo mật
-
-`~/.claude-accounts/` (chmod 700) chứa **refresh token** ở dạng plaintext, mỗi file
-chmod 600. Đừng commit thư mục này, cũng đừng để iCloud hay Dropbox sync nó.
-
-Muốn mã hoá thì bọc `openssl enc` quanh `read_creds`/`write_creds` — chưa làm vì sẽ
-phải nhập passphrase mỗi lần switch.
-
-Trên macOS, `security add-generic-password -w` nhận token qua `argv` nên nó lộ trong
-`ps` khoảng vài mili giây. Chấp nhận được trên máy cá nhân; máy nhiều người dùng thì
-cần gọi thẳng Security.framework.
-
-## Phát triển
-
-```bash
-./test.sh    # 29 checks
-```
-
-Test dựng một `$HOME` tạm và ép backend credential dạng file, nên Keychain thật không
-bao giờ bị ghi và tài khoản thật không bị đụng tới. Phần TUI chạy qua một pty thật. `CLAUDE_SESSIONS_DIR` cũng trỏ vào
-sandbox nên bộ test chạy như nhau trên mọi OS.
-
-```
-claude-switch    # toàn bộ chương trình, một file Python
-install.sh       # symlink vào PATH
-test.sh          # bộ test, chạy qua CLI nên không phụ thuộc chi tiết cài đặt
-VERSION          # nguồn duy nhất của số phiên bản
-```
-
-## Giấy phép
-
-[MIT](LICENSE) © Minh Tuấn

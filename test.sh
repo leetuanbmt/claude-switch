@@ -290,4 +290,237 @@ shown "Không phát hiện lỗi\|lỗi cần sửa" || fail "màn hình doctor 
 tui @click:30,17 $'\x1b' q || fail "TUI lỗi khi bấm chuột"
 shown "Không phát hiện lỗi\|lỗi cần sửa" || fail "bấm chuột không mở được mục menu"
 
-echo "PASS — 29 checks"
+# ==============================================================================
+# PHẦN 2: KIỂM THỬ AGENTS-SWITCH & OPENAI CODEX (Tham khảo từ codex-auth)
+# ==============================================================================
+AS="$(cd "$(dirname "$0")" && pwd)/agents-switch"
+CX="$(cd "$(dirname "$0")" && pwd)/codex-switch"
+
+login_codex_as() {  # $1=acc_id $2=email $3=plan
+  mkdir -p "$HOME/.codex"
+  python3 -c '
+import base64, json, sys
+header = base64.urlsafe_b64encode(b"{\"alg\":\"none\"}").decode().rstrip("=")
+payload_data = {
+    "email": sys.argv[2],
+    "sub": "user-" + sys.argv[1],
+    "https://api.openai.com/auth": {
+        "chatgpt_account_id": sys.argv[1],
+        "chatgpt_user_id": "user-" + sys.argv[1],
+        "plan_type": sys.argv[3],
+    }
+}
+payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
+jwt = f"{header}.{payload}."
+auth = {
+    "auth_mode": "chatgpt",
+    "OPENAI_API_KEY": None,
+    "tokens": {
+        "id_token": jwt,
+        "access_token": jwt,
+        "refresh_token": "tok-" + sys.argv[1],
+        "account_id": sys.argv[1]
+    },
+    "last_refresh": "2026-08-11T00:00:00+00:00"
+}
+json.dump(auth, open(sys.argv[4], "w"))
+' "$1" "$2" "$3" "$HOME/.codex/auth.json"
+}
+
+# 30. agents-switch clients liệt kê đầy đủ client claude và codex
+"$AS" clients | grep -q "claude" || fail "agents-switch clients thiếu client claude"
+"$AS" clients | grep -q "codex"  || fail "agents-switch clients thiếu client codex"
+
+# 31. agents-switch client get/set
+"$AS" client | grep -q "claude" || fail "default client ban đầu không phải claude"
+"$AS" client codex >/dev/null
+"$AS" client | grep -q "codex" || fail "không đặt được default client thành codex"
+"$AS" client claude >/dev/null
+
+# 32. agents-switch status hiển thị trạng thái tổng hợp các client
+"$AS" status | grep -q "Claude Code" || fail "status thiếu Claude Code"
+"$AS" status | grep -q "OpenAI Codex" || fail "status thiếu OpenAI Codex"
+
+# 33. codex save tự động sinh tên từ email
+login_codex_as acc-C1 charlie@openai.com pro
+"$AS" codex save >/dev/null
+[[ -f "$HOME/.codex-accounts/charlie.json" ]] || fail "codex save không tự sinh tên charlie từ email"
+
+# 34. codex save với tên chỉ định
+login_codex_as acc-C2 dave@openai.com plus
+"$CX" save work-dave >/dev/null
+[[ -f "$HOME/.codex-accounts/work-dave.json" ]] || fail "codex save không nhận tên chỉ định"
+
+# 35. codex status nhận diện đúng tài khoản active
+"$CX" status | grep -q "work-dave" || fail "codex status không nhận diện tài khoản hiện tại"
+
+# 36. codex switch hoán đổi credential trong ~/.codex/auth.json
+"$CX" switch charlie >/dev/null
+grep -q "tok-acc-C1" "$HOME/.codex/auth.json" || fail "codex switch không hoán đổi đúng auth.json"
+
+# 37. codex switch - quay lại tài khoản trước đó (tính năng từ codex-auth)
+"$CX" switch - >/dev/null
+"$CX" status | grep -q "work-dave" || fail "codex switch - không quay về work-dave"
+
+# 38. codex alias set và alias clear
+"$CX" alias set charlie ai-leader >/dev/null
+grep -q '"alias": "ai-leader"' "$HOME/.codex-accounts/charlie.json" || fail "alias set không ghi vào profile"
+"$CX" switch ai-leader >/dev/null
+"$CX" status | grep -q "charlie" || fail "không switch được bằng alias"
+"$CX" alias clear charlie >/dev/null
+grep -q '"alias": null' "$HOME/.codex-accounts/charlie.json" || fail "alias clear không xoá alias"
+
+# 39. codex next chuyển vòng tròn
+"$CX" next >/dev/null
+"$CX" status | grep -q "work-dave" || fail "codex next không chuyển sang profile tiếp theo"
+
+# 40. codex list đánh dấu * đúng profile đang dùng
+"$CX" list | grep -q '^\*  work-dave' || fail "codex list đánh dấu sai profile đang dùng"
+
+# 41. codex export và import
+EXP_DIR="$SANDBOX/codex-export"
+"$CX" export "$EXP_DIR" >/dev/null
+[[ -f "$EXP_DIR/work-dave.auth.json" ]] || fail "export không tạo file auth.json"
+"$CX" remove work-dave >/dev/null
+[[ ! -f "$HOME/.codex-accounts/work-dave.json" ]] || fail "remove không xoá profile"
+"$CX" import "$EXP_DIR" >/dev/null
+[[ -f "$HOME/.codex-accounts/work-dave.json" ]] || fail "import không phục hồi profile"
+
+# 42. codex remove --all xoá toàn bộ
+"$CX" remove --all >/dev/null
+[[ $(find "$HOME/.codex-accounts" -name "*.json" | wc -l | tr -d ' ') == "0" ]] || fail "remove --all không xoá hết profile"
+
+# 43. codex doctor phát hiện lỗi và cảnh báo biến môi trường
+login_codex_as acc-C3 eve@openai.com free
+"$CX" save eve >/dev/null
+OPENAI_API_KEY=sk-test "$CX" doctor | grep -q "OPENAI_API_KEY" || fail "doctor không cảnh báo OPENAI_API_KEY"
+
+# 44. bảo mật quyền file: profile 600, thư mục 700
+perm=$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o777)[2:])' "$HOME/.codex-accounts/eve.json")
+[[ "$perm" == "600" ]] || fail "profile Codex không phải chmod 600 (thực tế: $perm)"
+
+# 45. Multi-client TUI: phím Tab đổi client sang Codex
+tui_multi() {
+  python3 - "$AS" "$SANDBOX/tui_multi.out" "$@" <<'PY'
+import curses, fcntl, locale, os, pty, select, struct, sys, termios, time
+cs, outf, *keys = sys.argv[1:]
+env = dict(os.environ, TERM="xterm-256color")
+curses.setupterm("xterm-256color", 1)
+for loc in ("en_US.UTF-8", "C.UTF-8"):
+    try:
+        locale.setlocale(locale.LC_ALL, loc); env["LC_ALL"] = loc; break
+    except locale.Error:
+        pass
+pid, fd = pty.fork()
+if pid == 0:
+    fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 110, 0, 0))
+    os.execve(sys.executable, [sys.executable, cs], env)
+out = b""
+def drain(t):
+    global out
+    end = time.time() + t
+    while time.time() < end:
+        if select.select([fd], [], [], 0.05)[0]:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            out += chunk
+drain(0.8)
+for k in keys:
+    os.write(fd, k.encode()); drain(0.3)
+code = 124
+for _ in range(60):
+    r, st = os.waitpid(pid, os.WNOHANG)
+    if r:
+        code = os.WEXITSTATUS(st) if os.WIFEXITED(st) else 1
+        break
+    drain(0.05)
+else:
+    os.kill(pid, 9); os.waitpid(pid, 0)
+open(outf, "wb").write(out)
+sys.exit(code)
+PY
+}
+tui_multi $'\t' q || fail "Multi-client TUI bị lỗi khi đổi client"
+grep -aq "OpenAI Codex" "$SANDBOX/tui_multi.out" || fail "TUI không chuyển sang OpenAI Codex khi nhấn Tab"
+
+# 46. claude-switch switch <name> và claude-switch - (switch prev toggle)
+login_as uuid-T1 user1@test.com; "$CS" save t1 >/dev/null
+login_as uuid-T2 user2@test.com; "$CS" save t2 >/dev/null
+"$CS" switch t1 >/dev/null
+"$CS" status | grep -q "t1" || fail "claude-switch switch t1 không hoạt động"
+"$CS" - >/dev/null
+"$CS" status | grep -q "t2" || fail "claude-switch - không quay về tài khoản trước đó"
+"$CS" switch - >/dev/null
+"$CS" status | grep -q "t1" || fail "claude-switch switch - không toggle lại tài khoản"
+
+# 47. agents-switch switch và agents-switch - qua client mặc định
+"$AS" client claude >/dev/null
+"$AS" switch t2 >/dev/null
+"$CS" status | grep -q "t2" || fail "agents-switch switch không chuyển tiếp tới client mặc định"
+"$AS" - >/dev/null
+"$CS" status | grep -q "t1" || fail "agents-switch - không chuyển tiếp tới client mặc định"
+
+# 48. codex-switch switch bằng email (chứa @ mà không bị sập NAME_RE)
+login_codex_as acc-C4 frank@openai.com plus
+"$CX" save frank >/dev/null
+"$CX" switch eve >/dev/null
+"$CX" switch frank@openai.com >/dev/null
+"$CX" status | grep -q "frank" || fail "codex-switch switch bằng email thất bại"
+
+# 49. Nhiều tài khoản cùng email nhưng khác account_id nhận diện đúng
+login_codex_as org-personal dev@corp.com free
+"$CX" save corp-personal >/dev/null
+login_codex_as org-enterprise dev@corp.com enterprise
+"$CX" save corp-enterprise >/dev/null
+# Active đang là org-enterprise, status phải nhận diện corp-enterprise chứ không nhầm corp-personal
+"$CX" status | grep -q "corp-enterprise" || fail "nhầm tài khoản khi hai profile có cùng email"
+"$CX" switch corp-personal >/dev/null
+"$CX" status | grep -q "corp-personal" || fail "không switch được sang corp-personal khi cùng email"
+
+# 50. Phân tích JWT phân tách: id_token chứa email còn access_token chứa openai_auth (claims)
+mkdir -p "$SANDBOX/split-test"
+python3 -c '
+import base64, json, sys
+def make_jwt(data):
+    h = base64.urlsafe_b64encode(b"{\"alg\":\"none\"}").decode().rstrip("=")
+    p = base64.urlsafe_b64encode(json.dumps(data).encode()).decode().rstrip("=")
+    return f"{h}.{p}."
+
+id_tok = make_jwt({"email": "split@test.com", "name": "Split User"})
+acc_tok = make_jwt({"https://api.openai.com/auth": {"chatgpt_account_id": "acc-split-99", "plan_type": "team"}})
+
+auth = {
+    "auth_mode": "chatgpt",
+    "tokens": {
+        "id_token": id_tok,
+        "access_token": acc_tok,
+        "account_id": "acc-split-99"
+    }
+}
+json.dump(auth, open(sys.argv[1], "w"))
+' "$HOME/.codex/auth.json"
+"$CX" save split-prof >/dev/null
+grep -q '"plan": "Business"' "$HOME/.codex-accounts/split-prof.json" || fail "không trích xuất được plan từ access_token"
+grep -q '"email": "split@test.com"' "$HOME/.codex-accounts/split-prof.json" || fail "không trích xuất được email từ id_token"
+
+# 51. Chuyển tài khoản bằng số thứ tự hàng (row number 1-indexed)
+"$CX" switch 1 >/dev/null
+"$CX" status | grep -q "corp-enterprise" || fail "switch bằng số thứ tự 1 không chọn đúng profile đầu tiên"
+
+# 52. codex remove nhiều profile cùng một lệnh
+login_codex_as acc-del1 del1@test.com free; "$CX" save del-one >/dev/null
+login_codex_as acc-del2 del2@test.com free; "$CX" save del-two >/dev/null
+[[ -f "$HOME/.codex-accounts/del-one.json" && -f "$HOME/.codex-accounts/del-two.json" ]] || fail "lưu profile test remove thất bại"
+"$CX" remove del-one del-two >/dev/null
+[[ ! -f "$HOME/.codex-accounts/del-one.json" && ! -f "$HOME/.codex-accounts/del-two.json" ]] || fail "remove nhiều profile cùng lúc thất bại"
+
+# 53. Hỗ trợ cờ --client / -c trên agents-switch
+"$AS" -c codex list | grep -q "PROFILE" || fail "agents-switch -c codex không hoạt động"
+"$AS" --client claude status | grep -q "Đang dùng:" || fail "agents-switch --client claude không hoạt động"
+
+echo "PASS — 53 checks (All Claude Code + OpenAI Codex multi-client tests passed)"
+

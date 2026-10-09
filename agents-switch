@@ -1,0 +1,2302 @@
+#!/usr/bin/env python3
+"""agents-switch — Multi-Agent Multi-Client Account Switcher for AI Coding Agents.
+
+Hỗ trợ chuyển đổi đa tài khoản cho nhiều AI Coding Agent clients:
+  1. Claude Code (`claude`):
+     - Credential OAuth: macOS Keychain (service "Claude Code-credentials")
+       hoặc ~/.claude/.credentials.json
+     - Cấu hình & định danh: ~/.claude.json (oauthAccount + userID)
+     - Giữ nguyên toàn bộ settings, projects, CLAUDE.md, MCP servers
+     - Đồng bộ session Claude Desktop (sync-sessions)
+     - Giám sát Quota & Usage snapshot (5H / 7D)
+  2. OpenAI Codex (`codex`) — tham khảo cơ chế từ codex-auth:
+     - Auth file: ~/.codex/auth.json (hỗ trợ ChatGPT OAuth token & OpenAI API Key)
+     - Tự động giải mã JWT (id_token / access_token) lấy email, account_id, plan
+     - Hỗ trợ switch nhanh tài khoản trước đó (`switch -`), alias, import/export, login
+     - Tương thích Codex CLI, VS Code extension, Codex App
+
+Tương thích ngược 100%:
+  - Khi gọi qua symlink/lệnh `claude-switch`: hoạt động hoàn toàn như bản claude-switch gốc.
+  - Khi gọi qua symlink/lệnh `codex-switch`: hoạt động chuyên biệt cho Codex.
+  - Khi gọi `agents-switch`: quản lý tập trung nhiều client, chuyển đổi linh hoạt qua CLI & TUI.
+
+Tiêu chí: Một file Python duy nhất, chỉ dùng thư viện chuẩn (stdlib), không cài thêm dependency.
+"""
+import base64
+import contextlib
+import hashlib
+import io
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Thử import fcntl (khoá file trên Unix/macOS/Linux). Trên Windows gán None để bỏ qua.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+# Thử import curses cho giao diện terminal tương tác (TUI). Windows không có curses.
+try:
+    import curses
+except ImportError:
+    curses = None
+
+# Thiết lập umask 0077: Mọi file/thư mục mới tạo chỉ user hiện tại có quyền đọc/ghi (chmod 600/700).
+# Điều này tối quan trọng vì profile chứa access token và refresh token.
+os.umask(0o077)
+
+# --- Các đường dẫn cơ sở (derive từ $HOME để hỗ trợ sandbox test khi override HOME) ---
+HOME = Path.home()
+
+# Thư mục cấu hình chung của agents-switch
+AGENTS_DIR = HOME / ".agents-switch"
+DEFAULT_CLIENT_FILE = AGENTS_DIR / ".current_client"
+
+# Biểu thức chính quy kiểm tra tên profile hợp lệ, chống tấn công path traversal (../../etc/passwd)
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# Đọc phiên bản từ file VERSION nằm cạnh script trong repo
+VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "2.0.0"
+
+
+def die(msg: str):
+    """In thông báo lỗi ra stderr và dừng chương trình với mã thoát 1."""
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def ok(msg: str):
+    """In thông báo thành công ra stdout."""
+    print(f"[OK] {msg}")
+
+
+def write_json(path: Path, data):
+    """Ghi dữ liệu JSON an toàn (atomic write) với chmod 600.
+    
+    Tạo file tạm đuôi .tmp trước, ghi nội dung JSON, rồi dùng os.replace để hoán đổi.
+    Tránh tình trạng file bị hỏng nếu tiến trình bị ngắt đột ngột (kill, mất điện).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def load_json(path: Path) -> dict:
+    """Đọc dữ liệu từ file JSON, trả về dict rỗng nếu file không tồn tại hoặc lỗi cú pháp."""
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def parse_jwt_payload(token: str) -> dict:
+    """Giải mã payload của token JWT (JSON Web Token) mà không cần thư viện bên ngoài.
+    
+    JWT gồm 3 phần phân tách bởi dấu chấm: header.payload.signature.
+    Phần payload được mã hoá Base64URL. Hàm thêm padding '=' hợp lệ và giải mã JSON.
+    Trả về dict rỗng nếu token không hợp lệ.
+    """
+    if not token or not isinstance(token, str):
+        return {}
+    parts = token.strip().split(".")
+    if len(parts) < 2:
+        return {}
+    payload_b64 = parts[1]
+    # Bổ sung padding cho độ dài chia hết cho 4 theo quy tắc Base64
+    payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
+    try:
+        decoded_bytes = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
+        return json.loads(decoded_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        return {}
+
+
+def process_count(name: str) -> int:
+    """Đếm số tiến trình đang chạy theo tên (dùng pgrep). Trả về 0 nếu không tìm thấy."""
+    try:
+        r = subprocess.run(["pgrep", "-x", name], capture_output=True, text=True)
+        return len(r.stdout.split()) if r.returncode == 0 else 0
+    except OSError:
+        return 0
+
+
+# ==============================================================================
+# 1. CLIENT: CLAUDE CODE (claude)
+# ==============================================================================
+
+class ClaudeClient:
+    """Quản lý tài khoản cho Claude Code CLI và Claude Desktop."""
+
+    ID = "claude"
+    NAME = "Claude Code"
+
+    def __init__(self):
+        self.acc_dir = HOME / ".claude-accounts"
+        self.backup_dir = self.acc_dir / "backups"
+        self.state_file = self.acc_dir / ".last"
+        self.prev_file = self.acc_dir / ".previous"
+        self.config_file = HOME / ".claude.json"
+        self.creds_file = HOME / ".claude" / ".credentials.json"
+        self.kc_service = "Claude Code-credentials"
+
+    def ensure_dirs(self):
+        """Khởi tạo các thư mục lưu trữ profile và bản sao lưu với quyền bảo mật 700."""
+        self.acc_dir.mkdir(parents=True, exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.acc_dir, 0o700)
+            os.chmod(self.backup_dir, 0o700)
+        except OSError:
+            pass
+
+    def sessions_dir(self) -> Path:
+        """Đường dẫn thư mục phiên làm việc của Claude Desktop."""
+        override = os.environ.get("CLAUDE_SESSIONS_DIR")
+        if override:
+            return Path(override)
+        if sys.platform == "darwin":
+            return HOME / "Library/Application Support/Claude/claude-code-sessions"
+        if os.name == "nt":
+            base = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming")
+            return base / "Claude/claude-code-sessions"
+        base = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+        return base / "Claude/claude-code-sessions"
+
+    def profile_path(self, name: str) -> Path:
+        """Đường dẫn file profile từ tên, kiểm tra chống path traversal."""
+        if not NAME_RE.match(name or ""):
+            die(f"Tên không hợp lệ: '{name}' (chỉ cho phép chữ, số, . _ -)")
+        return self.acc_dir / f"{name}.json"
+
+    def profile_names(self) -> list:
+        """Danh sách tên các profile Claude Code đã lưu theo thứ tự alphabet."""
+        if not self.acc_dir.exists():
+            return []
+        return sorted(
+            p.stem for p in self.acc_dir.glob("*.json") if not p.name.startswith(".")
+        )
+
+    def use_file_backend(self) -> bool:
+        """Xác định dùng file credentials hay Keychain (file được ưu tiên nếu đã tồn tại hoặc không phải macOS)."""
+        return self.creds_file.exists() or sys.platform != "darwin"
+
+    def read_creds(self) -> str:
+        """Đọc credential hiện tại từ file hoặc macOS Keychain."""
+        if self.use_file_backend():
+            return self.creds_file.read_text() if self.creds_file.exists() else ""
+        r = subprocess.run(
+            ["security", "find-generic-password", "-a", os.environ.get("USER", ""),
+             "-s", self.kc_service, "-w"],
+            capture_output=True, text=True,
+        )
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def write_creds(self, blob: str):
+        """Ghi credential vào file (~/.claude/.credentials.json) hoặc Keychain."""
+        if not blob:
+            die("credential rỗng, không ghi")
+        if self.use_file_backend():
+            self.creds_file.parent.mkdir(parents=True, exist_ok=True)
+            self.creds_file.write_text(blob)
+            os.chmod(self.creds_file, 0o600)
+            return
+        r = subprocess.run(
+            ["security", "add-generic-password", "-U", "-a", os.environ.get("USER", ""),
+             "-s", self.kc_service, "-w", blob],
+            capture_output=True,
+        )
+        if r.returncode != 0:
+            die("không ghi được Keychain")
+
+    def load_config(self) -> dict:
+        """Đọc cấu hình ~/.claude.json."""
+        return load_json(self.config_file)
+
+    def current_uuid(self) -> str:
+        """UUID của tài khoản Claude Code đang đăng nhập."""
+        return self.load_config().get("oauthAccount", {}).get("accountUuid") or ""
+
+    def current_org(self) -> str:
+        """UUID của organization đang hoạt động trong Claude Code."""
+        return self.load_config().get("oauthAccount", {}).get("organizationUuid") or ""
+
+    def current_profile(self) -> str:
+        """Tìm tên profile trùng khớp với accountUuid đang active."""
+        uuid = self.current_uuid()
+        if not uuid:
+            return ""
+        for name in self.profile_names():
+            prof = load_json(self.acc_dir / f"{name}.json")
+            if prof.get("oauthAccount", {}).get("accountUuid") == uuid:
+                return name
+        return ""
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Đảm bảo chỉ một tiến trình ghi dữ liệu profile Claude tại một thời điểm."""
+        self.ensure_dirs()
+        if fcntl is None:
+            yield
+            return
+        lock_file = self.acc_dir / ".lock"
+        with open(lock_file, "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                die("đang có lệnh claude-switch khác chạy — thử lại sau vài giây")
+            yield
+
+    def backup_config(self):
+        """Giữ tối đa 10 bản sao lưu gần nhất của ~/.claude.json trước khi ghi đè."""
+        if not self.config_file.exists():
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy(self.config_file, self.backup_dir / f"claude.json.{stamp}.{os.getpid()}")
+        old = sorted(self.backup_dir.glob("claude.json.*"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-10]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def name_from_email(self, cfg: dict) -> str:
+        """Trích xuất tên gợi ý từ email (lấy phần trước dấu @)."""
+        email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+        return re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0]) if email else ""
+
+    def save(self, name: str = "", quiet: bool = False):
+        """Lưu trạng thái đăng nhập hiện tại thành một profile Claude Code."""
+        creds = self.read_creds()
+        if not creds:
+            die("chưa đăng nhập (không tìm thấy credential). Chạy `claude` và đăng nhập trước.")
+        if not self.config_file.exists():
+            die(f"không tìm thấy {self.config_file}")
+        cfg = self.load_config()
+
+        if not name:
+            name = self.name_from_email(cfg)
+            if not name:
+                die("không suy ra được tên từ email, truyền tên: claude-switch save <name>")
+
+        out = self.profile_path(name)
+        try:
+            creds_data = json.loads(creds)
+        except Exception:
+            creds_data = creds
+
+        write_json(out, {
+            "credentials": creds_data,
+            "oauthAccount": cfg.get("oauthAccount", {}),
+            "userID": cfg.get("userID"),
+            "usage": cfg.get("cachedUsageUtilization"),
+            "savedAt": int(time.time()),
+        })
+        if not quiet:
+            ok(f"Đã lưu profile '{name}'")
+
+    def resolve_profile_name(self, query: str) -> str:
+        """Tìm tên profile Claude khớp với truy vấn: tên, số hàng (1-indexed), hoặc email.
+        
+        Quy tắc:
+        1. Khớp chính xác tên profile hợp lệ (nếu query là tên hợp lệ và file tồn tại).
+        2. Khớp số thứ tự hàng hiển thị (1, 2, ...).
+        3. Khớp chính xác email trong cấu hình profile.
+        4. Khớp tiền tố hoặc chuỗi con (tên hoặc email).
+        """
+        if not query:
+            return ""
+        names = self.profile_names()
+        if not names:
+            return ""
+
+        # 1. Khớp chính xác tên profile hợp lệ
+        if NAME_RE.match(query) and self.profile_path(query).exists():
+            return query
+
+        # 2. Khớp số thứ tự hàng (1-indexed row number)
+        if query.isdigit():
+            idx = int(query)
+            if 1 <= idx <= len(names):
+                return names[idx - 1]
+
+        q_lower = query.lower()
+        profiles = []
+        for name in names:
+            p = load_json(self.profile_path(name))
+            if p:
+                profiles.append((name, p))
+
+        # 3. Khớp chính xác email
+        for name, p in profiles:
+            email = p.get("oauthAccount", {}).get("emailAddress", "").lower()
+            if email == q_lower:
+                return name
+
+        # 4. Khớp tiền tố hoặc chuỗi con
+        for name, p in profiles:
+            if name.lower().startswith(q_lower):
+                return name
+            email = p.get("oauthAccount", {}).get("emailAddress", "").lower()
+            if email and (email.startswith(q_lower) or q_lower in email):
+                return name
+
+        return ""
+
+    def use(self, query: str):
+        """Chuyển sang profile Claude Code được chỉ định (hỗ trợ tên, số hàng, email)."""
+        if not query:
+            die("Usage: claude-switch switch <name|email>")
+        name = self.resolve_profile_name(query)
+        if not name:
+            die(f"không có profile '{query}'. Xem: claude-switch list")
+        src = self.profile_path(name)
+        prof = load_json(src)
+
+        cur = self.current_profile()
+        if cur and cur != name:
+            self.save(cur, quiet=True)
+            print(f"[..] Đã cập nhật profile hiện tại: {cur}")
+            self.prev_file.write_text(cur)
+        elif not cur and self.current_uuid():
+            print("[!] Tài khoản đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
+                  "    Huỷ (Ctrl-C) rồi chạy: claude-switch save <name>")
+
+        self.backup_config()
+        cfg = self.load_config()
+        cfg["oauthAccount"] = prof.get("oauthAccount", {})
+        cfg["userID"] = prof.get("userID")
+        cfg.pop("cachedUsageUtilization", None)
+        write_json(self.config_file, cfg)
+
+        creds = prof.get("credentials")
+        self.write_creds(json.dumps(creds) if isinstance(creds, dict) else str(creds))
+        self.state_file.write_text(name)
+        ok(f"Đã chuyển sang '{name}'")
+        n = process_count("claude")
+        print(f"    Đang có {n} tiến trình claude chạy bằng token cũ — thoát hẳn rồi mở lại." if n
+              else "    Mở Claude Code để dùng tài khoản mới.")
+
+    def switch_prev(self):
+        """Chuyển đổi về tài khoản Claude Code trước đó (tương tự 'switch -' trong codex-auth)."""
+        if not self.prev_file.exists():
+            die("Chưa ghi nhận tài khoản trước đó để chuyển")
+        prev = self.prev_file.read_text().strip()
+        if not prev or not self.profile_path(prev).exists():
+            die(f"Tài khoản trước đó '{prev}' không còn tồn tại")
+        self.use(prev)
+
+    def next(self):
+        """Chuyển sang profile Claude Code tiếp theo theo vòng tròn alphabet."""
+        names = self.profile_names()
+        if not names:
+            die("chưa có profile nào")
+        last = self.current_profile() or (self.state_file.read_text().strip() if self.state_file.exists() else "")
+        idx = names.index(last) if last in names else -1
+        self.use(names[(idx + 1) % len(names)])
+
+    def remove(self, query: str):
+        """Xoá bỏ một profile Claude Code và dọn dẹp liên kết trạng thái cũ."""
+        if not query:
+            die("Usage: claude-switch remove <name>")
+        name = self.resolve_profile_name(query)
+        if not name:
+            die(f"không có profile '{query}'")
+        f = self.profile_path(name)
+        f.unlink(missing_ok=True)
+        if self.prev_file.exists() and self.prev_file.read_text().strip() == name:
+            self.prev_file.unlink(missing_ok=True)
+        if self.state_file.exists() and self.state_file.read_text().strip() == name:
+            self.state_file.unlink(missing_ok=True)
+        ok(f"Đã xoá profile '{name}' (tài khoản trên server không bị ảnh hưởng)")
+
+    def load_rows(self) -> list:
+        """Nạp danh sách các profile Claude kèm trạng thái và thông số quota."""
+        cur = self.current_profile()
+        live = self.load_config().get("cachedUsageUtilization")
+        rows = []
+        for n in self.profile_names():
+            p = load_json(self.acc_dir / f"{n}.json")
+            if not p:
+                continue
+            usage, saved = p.get("usage"), p.get("savedAt")
+            is_live = n == cur and bool(live)
+            if is_live:
+                usage = live
+            a = p.get("oauthAccount", {})
+            rows.append({
+                "name": n,
+                "cur": n == cur,
+                "email": a.get("emailAddress", "?"),
+                "org": a.get("organizationName") or a.get("billingType") or "",
+                "usage": (usage or {}).get("utilization") or {},
+                "saved": saved,
+                "live": is_live,
+            })
+        return rows
+
+    def list(self):
+        """In danh sách các profile Claude Code."""
+        rows = self.load_rows()
+        if not rows:
+            print("Chưa có profile nào. Lưu tài khoản hiện tại: claude-switch save <name>")
+            return
+        for r in rows:
+            print("%s %-14s %-32s %s" % ("*" if r["cur"] else " ", r["name"], r["email"], r["org"]))
+
+    def status(self):
+        """In trạng thái tài khoản Claude Code đang active kèm thông tin email."""
+        cur = self.current_profile()
+        cfg = self.load_config()
+        email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+        if cur:
+            detail = f" · {email}" if email else ""
+            ok(f"Đang dùng: {cur}{detail}")
+        elif self.current_uuid():
+            detail = f": {email}" if email else ""
+            print(f"[?] Đang đăng nhập một tài khoản chưa được lưu thành profile{detail}")
+        else:
+            print("[?] Chưa đăng nhập")
+
+    def usage(self):
+        """Hiển thị bảng Quota 5h / 7 ngày của các profile Claude Code."""
+        rows = self.load_rows()
+        if not rows:
+            print("Chưa có profile nào.")
+            return
+
+        def pct(u, key):
+            b = u.get(key)
+            if not b:
+                return "  ?  ", ""
+            resets = b.get("resets_at") or ""
+            if resets:
+                try:
+                    resets = "reset " + datetime.fromisoformat(resets).astimezone().strftime("%d/%m %H:%M")
+                except Exception:
+                    pass
+            return "%3d%%" % b.get("utilization", 0), resets
+
+        print("%-14s %-28s %-6s %-6s %-6s %s" % ("PROFILE", "EMAIL", "5H", "7D", "NGUỒN", ""))
+        for r in rows:
+            h5, _ = pct(r["usage"], "five_hour")
+            d7, r7 = pct(r["usage"], "seven_day")
+            print("%-14s %-28s %-6s %-6s %-6s %s" % (
+                r["name"], r["email"], h5, d7, "live" if r["live"] else _age(r["saved"]), r7))
+        print("\nlive = tài khoản đang dùng, đọc từ ~/.claude.json. Còn lại là snapshot lúc profile")
+        print("được lưu (tự cập nhật mỗi lần switch). Số realtime: claude  →  /usage")
+
+    def doctor(self):
+        """Kiểm tra sức khoẻ cấu hình, quyền hạn và tính toàn vẹn của Claude Code."""
+        bad = 0
+
+        def line(level, msg):
+            nonlocal bad
+            print({"ok": "[OK]   ", "warn": "[!]    ", "err": "[ERROR]"}[level], msg)
+            bad += level == "err"
+
+        for v in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+            if os.environ.get(v):
+                line("warn", f"biến {v} đang đặt — nó ưu tiên hơn credential đã đăng nhập, "
+                             "nên switch không có tác dụng trong shell này")
+        line("ok", "credential: " + ("file " + str(self.creds_file) if self.use_file_backend() else "macOS Keychain"))
+        if not self.read_creds():
+            line("warn", "chưa đăng nhập (không có credential)")
+        if self.acc_dir.exists() and (self.acc_dir.stat().st_mode & 0o077):
+            line("err", f"{self.acc_dir} cho phép nhóm/người khác truy cập — chạy: chmod 700 {self.acc_dir}")
+
+        uuids = {}
+        for n in self.profile_names():
+            f = self.acc_dir / f"{n}.json"
+            if f.stat().st_mode & 0o077:
+                line("err", f"profile '{n}' chứa refresh token nhưng không phải chmod 600")
+            try:
+                p = json.loads(f.read_text())
+                u = p["oauthAccount"]["accountUuid"]
+                assert p["credentials"] and p["userID"]
+            except Exception:
+                line("err", f"profile '{n}' hỏng hoặc thiếu trường — lưu lại: claude-switch save {n}")
+                continue
+            uuids.setdefault(u, []).append(n)
+        for names in uuids.values():
+            if len(names) > 1:
+                line("warn", f"các profile {', '.join(names)} là cùng một tài khoản")
+        if self.current_uuid() and not self.current_profile():
+            line("warn", "tài khoản đang đăng nhập chưa được lưu thành profile")
+        n = process_count("claude")
+        if n:
+            line("ok", f"{n} tiến trình claude đang chạy (giữ token cũ nếu bạn vừa switch)")
+        s_dir = self.sessions_dir()
+        line("ok" if s_dir.is_dir() else "warn",
+             f"Claude Desktop sessions: {s_dir}" + ("" if s_dir.is_dir() else " (chưa có — bỏ qua nếu không dùng Desktop)"))
+        print("\nKhông phát hiện lỗi." if not bad else f"\n{bad} lỗi cần sửa.")
+        sys.exit(1 if bad else 0)
+
+    # --- Đồng bộ session Claude Desktop ---
+    def account_labels(self) -> dict:
+        out = {}
+        for n in self.profile_names():
+            try:
+                p = load_json(self.acc_dir / f"{n}.json")
+                out[p["oauthAccount"]["accountUuid"]] = n
+            except Exception:
+                pass
+        return out
+
+    def session_candidates(self):
+        uuid, org = self.current_uuid(), self.current_org()
+        if not uuid or not org:
+            die("chưa đăng nhập, không biết gộp về đâu")
+        s_dir = self.sessions_dir()
+        if not s_dir.is_dir():
+            die(f"không có {s_dir} — Claude Desktop chưa chạy lần nào? "
+                "Đường dẫn khác thì đặt CLAUDE_SESSIONS_DIR")
+        dst, labels, out = s_dir / uuid / org, self.account_labels(), []
+        for src in sorted(s_dir.glob("*/*")):
+            if not src.is_dir() or src == dst:
+                continue
+            for f in sorted(src.glob("local_*.json")):
+                meta = load_json(f)
+                d = dst / f.name
+                out.append({
+                    "path": f, "name": f.name, "src_uuid": src.parent.name,
+                    "src": labels.get(src.parent.name, src.parent.name[:8]),
+                    "ids": [f.stem, meta.get("cliSessionId") or ""],
+                    "title": meta.get("title") or "(không tên)", "cwd": meta.get("cwd") or "",
+                    "ts": _sess_ts(f, meta),
+                    "dst_ts": _sess_ts(d, load_json(d)) if d.exists() else None,
+                })
+        out.sort(key=lambda x: -x["ts"])
+        return dst, out
+
+    def sync_sessions(self, args=()):
+        opt = {"apply": False, "update": False, "from": "", "ids": []}
+        it = iter(args)
+        for a in it:
+            if a in ("--apply", "--update"):
+                opt[a[2:]] = True
+            elif a in ("--from", "--session"):
+                v = next(it, "")
+                if not v:
+                    die(f"{a} cần một giá trị. Xem: claude-switch help")
+                if a == "--from":
+                    opt["from"] = v
+                else:
+                    opt["ids"].append(v)
+            else:
+                die(f"tuỳ chọn không hợp lệ: {a}. Xem: claude-switch help")
+
+        dst, cands = self.session_candidates()
+        plan = plan_sync(cands, opt["from"], opt["ids"], opt["update"])
+        marks = {"copy": "+", "update": "~", "skip": "="}
+        for act, c in plan:
+            print("%s %-5s %-38s %-14s %s" % (
+                marks[act], _age(c["ts"]), c["title"][:38], c["src"][:14], c["cwd"]))
+        todo = sum(1 for act, _ in plan if act != "skip")
+        print(f"\n{todo} sẽ gộp, {len(plan) - todo} bỏ qua (+ mới, ~ cập nhật, = đã có).")
+        if not opt["apply"]:
+            print("Chưa ghi gì. Thêm --apply để thực hiện.")
+        elif todo:
+            apply_sync(plan, dst)
+
+
+def _sess_ts(f: Path, meta: dict) -> float:
+    return (meta.get("lastActivityAt") or f.stat().st_mtime * 1000) / 1000
+
+
+def plan_sync(cands, from_="", ids=(), update=False):
+    plan = []
+    for c in cands:
+        if from_ and from_ != c["src"] and not c["src_uuid"].startswith(from_):
+            continue
+        if ids and not any(i and i in x for i in ids for x in c["ids"]):
+            continue
+        if c["dst_ts"] is None:
+            plan.append(("copy", c))
+        elif update and c["ts"] > c["dst_ts"]:
+            plan.append(("update", c))
+        else:
+            plan.append(("skip", c))
+    return plan
+
+
+def apply_sync(plan, dst: Path) -> int:
+    dst.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for act, c in plan:
+        if act != "skip":
+            shutil.copy(c["path"], dst / c["name"])
+            n += 1
+    ok(f"Đã gộp {n} session vào tài khoản đang dùng")
+    print("    Thoát hẳn Claude Desktop (⌘Q) rồi mở lại để thấy danh sách mới.")
+    return n
+
+
+# ==============================================================================
+# 2. CLIENT: OPENAI CODEX (codex) — Tham khảo từ https://github.com/loongphy/codex-auth
+# ==============================================================================
+
+def normalize_codex_plan(s: str) -> str:
+    """Chuẩn hoá tên gói dịch vụ Codex/ChatGPT (free, plus, pro, business, enterprise)."""
+    s = (s or "").lower()
+    if s in ("free", "go", "plus", "prolite", "pro"):
+        return s.capitalize()
+    if s in ("team", "self_serve_business_usage_based", "business"):
+        return "Business"
+    if s in ("enterprise", "enterprise_cbp_usage_based", "hc"):
+        return "Enterprise"
+    if s in ("education", "edu"):
+        return "Edu"
+    return s.capitalize() if s else "Unknown"
+
+
+class CodexClient:
+    """Quản lý tài khoản cho OpenAI Codex CLI, VS Code Extension và Codex App.
+    
+    Cơ chế quản lý lấy cảm hứng từ tool codex-auth:
+    - Quản lý file ~/.codex/auth.json (hoặc $CODEX_HOME/auth.json)
+    - Giải mã JWT để trích xuất email, account_id, user_id, plan_type
+    - Hỗ trợ đổi tài khoản trước đó `switch -`
+    - Hỗ trợ gán alias, export/import danh sách profile, login tự động
+    """
+
+    ID = "codex"
+    NAME = "OpenAI Codex"
+
+    def __init__(self):
+        self.codex_home = Path(os.environ.get("CODEX_HOME") or HOME / ".codex")
+        self.auth_file = self.codex_home / "auth.json"
+        self.acc_dir = HOME / ".codex-accounts"
+        self.backup_dir = self.acc_dir / "backups"
+        self.export_dir = self.acc_dir / "export"
+        self.state_file = self.acc_dir / ".last"
+        self.prev_file = self.acc_dir / ".previous"
+
+    def ensure_dirs(self):
+        """Khởi tạo thư mục ~/.codex-accounts và backups với chmod 700."""
+        self.acc_dir.mkdir(parents=True, exist_ok=True)
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.acc_dir, 0o700)
+            os.chmod(self.backup_dir, 0o700)
+        except OSError:
+            pass
+
+    def profile_path(self, name: str) -> Path:
+        """Đường dẫn tới file profile .json từ tên."""
+        if not NAME_RE.match(name or ""):
+            die(f"Tên không hợp lệ: '{name}' (chỉ cho phép chữ, số, . _ -)")
+        return self.acc_dir / f"{name}.json"
+
+    def profile_names(self) -> list:
+        """Danh sách tên các profile Codex đã lưu."""
+        if not self.acc_dir.exists():
+            return []
+        return sorted(
+            p.stem for p in self.acc_dir.glob("*.json") if not p.name.startswith(".")
+        )
+
+    def load_auth_file(self) -> dict:
+        """Đọc nội dung auth.json của Codex."""
+        return load_json(self.auth_file)
+
+    def parse_auth_info(self, auth_data: dict) -> dict:
+        """Phân tích cấu trúc auth.json thành thông tin tài khoản hoàn chỉnh.
+        
+        Hỗ trợ các định dạng:
+        1. API Key: OPENAI_API_KEY hoặc api_key có giá trị chuỗi.
+        2. ChatGPT OAuth: tokens chứa id_token/access_token (JWT) và refresh_token.
+        3. CPA / Proxy: id_token/access_token/account_id đặt trực tiếp ở root auth.json.
+        """
+        if not auth_data or not isinstance(auth_data, dict):
+            return {}
+
+        api_key = auth_data.get("OPENAI_API_KEY") or auth_data.get("api_key") or auth_data.get("apiKey")
+        if isinstance(api_key, str) and api_key.strip():
+            k = api_key.strip()
+            masked = f"{k[:7]}...{k[-4:]}" if len(k) >= 12 else k[:4] + "..."
+            key_hash = hashlib.sha256(k.encode()).hexdigest()[:8]
+            return {
+                "auth_mode": "apikey",
+                "email": f"API Key ({masked})",
+                "account_id": f"apikey-{key_hash}",
+                "user_id": f"apikey-{key_hash}",
+                "plan": "API",
+                "account_name": "API Key",
+                "last_refresh": auth_data.get("last_refresh"),
+            }
+
+        # Chế độ OAuth hoặc CPA proxy token
+        tokens = auth_data.get("tokens") if isinstance(auth_data.get("tokens"), dict) else auth_data
+        id_token = tokens.get("id_token") or auth_data.get("id_token") or ""
+        access_token = tokens.get("access_token") or auth_data.get("access_token") or ""
+
+        # Giải mã và hợp nhất thông tin từ cả 2 JWT payload (id_token và access_token)
+        # Vì id_token thường chứa email/name (OIDC) còn access_token chứa claims https://api.openai.com/auth
+        id_payload = parse_jwt_payload(id_token) if id_token else {}
+        access_payload = parse_jwt_payload(access_token) if access_token else {}
+        payload = {**access_payload, **id_payload}
+
+        openai_auth = (
+            id_payload.get("https://api.openai.com/auth")
+            or access_payload.get("https://api.openai.com/auth")
+            or payload.get("https://api.openai.com/auth")
+            or {}
+        )
+
+        email = (
+            payload.get("email")
+            or auth_data.get("email")
+            or tokens.get("email")
+            or ""
+        )
+        account_id = (
+            openai_auth.get("chatgpt_account_id")
+            or tokens.get("account_id")
+            or auth_data.get("account_id")
+            or payload.get("chatgpt_account_id")
+            or payload.get("account_id")
+            or ""
+        )
+        user_id = (
+            openai_auth.get("chatgpt_user_id")
+            or payload.get("sub")
+            or tokens.get("user_id")
+            or auth_data.get("user_id")
+            or ""
+        )
+        raw_plan = (
+            openai_auth.get("plan_type")
+            or payload.get("plan")
+            or payload.get("plan_type")
+            or auth_data.get("plan")
+        )
+        plan = normalize_codex_plan(raw_plan)
+
+        # Kiểm tra tính hợp lệ: file phải chứa ít nhất token, key, email hoặc account_id
+        if not (id_token or access_token or email or account_id):
+            return {}
+
+        return {
+            "auth_mode": auth_data.get("auth_mode", "chatgpt"),
+            "email": email or (f"acc-{account_id[:8]}" if account_id else "unknown"),
+            "account_id": account_id or (email if email else "unknown"),
+            "user_id": user_id,
+            "plan": plan,
+            "account_name": payload.get("name") or "",
+            "last_refresh": auth_data.get("last_refresh"),
+        }
+
+    def current_auth_info(self) -> dict:
+        """Thông tin tài khoản Codex đang đăng nhập."""
+        data = self.load_auth_file()
+        return self.parse_auth_info(data)
+
+    def current_profile(self) -> str:
+        """Xác định tên profile trùng khớp với tài khoản Codex đang active.
+        
+        Ưu tiên:
+        1. Khớp chính xác account_id (tránh nhầm khi cùng email nhưng khác tổ chức/tài khoản).
+        2. Khớp user_id.
+        3. Khớp email.
+        """
+        info = self.current_auth_info()
+        acc_id = info.get("account_id")
+        email = info.get("email")
+        if not acc_id and not email:
+            return ""
+
+        profiles = []
+        for name in self.profile_names():
+            p = load_json(self.profile_path(name))
+            if p:
+                profiles.append((name, p))
+
+        # 1. Ưu tiên khớp chính xác account_id
+        if acc_id:
+            for name, p in profiles:
+                if p.get("account_id") == acc_id:
+                    return name
+
+        # 2. Khớp user_id nếu có
+        user_id = info.get("user_id")
+        if user_id:
+            for name, p in profiles:
+                if p.get("user_id") == user_id:
+                    return name
+
+        # 3. Cuối cùng mới khớp email nếu không phân biệt được theo ID
+        if email:
+            for name, p in profiles:
+                if (p.get("email") or "").lower() == email.lower():
+                    return name
+
+        return ""
+
+    @contextlib.contextmanager
+    def lock(self):
+        """Khoá tránh ghi đè đồng thời giữa hai lệnh switch Codex."""
+        self.ensure_dirs()
+        if fcntl is None:
+            yield
+            return
+        lock_file = self.acc_dir / ".lock"
+        with open(lock_file, "w") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                die("đang có lệnh codex-switch khác chạy — thử lại sau vài giây")
+            yield
+
+    def backup_auth(self):
+        """Sao lưu file ~/.codex/auth.json trước mỗi lần hoán đổi."""
+        if not self.auth_file.exists():
+            return
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy(self.auth_file, self.backup_dir / f"auth.json.{stamp}.{os.getpid()}")
+        old = sorted(self.backup_dir.glob("auth.json.*"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-10]:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    def name_from_info(self, info: dict) -> str:
+        """Tự động suy ra tên profile từ email hoặc tên tài khoản."""
+        email = info.get("email", "")
+        if "@" in email:
+            base = re.sub(r"[^A-Za-z0-9._-]", "-", email.split("@")[0])
+            acc_id = info.get("account_id", "")
+            out = self.profile_path(base)
+            if out.exists():
+                existing = load_json(out)
+                if acc_id and existing.get("account_id") and existing.get("account_id") != acc_id:
+                    return f"{base}-{acc_id[:4]}"
+            return base
+        acc_id = info.get("account_id", "")
+        if acc_id:
+            return f"codex-{acc_id[:8]}"
+        return "codex-account"
+
+    def resolve_profile_name(self, query: str) -> str:
+        """Tìm tên profile khớp với truy vấn: tên profile, số thứ tự hàng, alias, email, account_id."""
+        if not query:
+            return ""
+        names = self.profile_names()
+        if not names:
+            return ""
+
+        # 1. Khớp chính xác tên profile hợp lệ (chỉ gọi profile_path khi query hợp lệ)
+        if NAME_RE.match(query) and self.profile_path(query).exists():
+            return query
+
+        # 2. Khớp số thứ tự hàng (1-indexed row number từ list)
+        if query.isdigit():
+            idx = int(query)
+            if 1 <= idx <= len(names):
+                return names[idx - 1]
+
+        q_lower = query.lower()
+        profiles = []
+        for name in names:
+            p = load_json(self.profile_path(name))
+            if p:
+                profiles.append((name, p))
+
+        # 3. Khớp chính xác alias
+        for name, p in profiles:
+            if (p.get("alias") or "").lower() == q_lower:
+                return name
+
+        # 4. Khớp chính xác email
+        for name, p in profiles:
+            if (p.get("email") or "").lower() == q_lower:
+                return name
+
+        # 5. Khớp chính xác account_id
+        for name, p in profiles:
+            if (p.get("account_id") or "").lower() == q_lower:
+                return name
+
+        # 6. Khớp tiền tố hoặc fragment
+        for name, p in profiles:
+            if name.lower().startswith(q_lower):
+                return name
+            alias = (p.get("alias") or "").lower()
+            if alias and (alias.startswith(q_lower) or q_lower in alias):
+                return name
+            email = (p.get("email") or "").lower()
+            if email and (email.startswith(q_lower) or q_lower in email):
+                return name
+
+        return ""
+
+    def save(self, name: str = "", alias: str = "", quiet: bool = False):
+        """Lưu auth.json hiện tại của Codex thành một profile."""
+        if not self.auth_file.exists():
+            die(f"chưa đăng nhập Codex (không tìm thấy {self.auth_file}). Chạy `codex login` trước.")
+        raw_auth = self.load_auth_file()
+        info = self.parse_auth_info(raw_auth)
+        if not info:
+            die(f"file {self.auth_file} không có thông tin xác thực hợp lệ")
+
+        if not name:
+            name = self.name_from_info(info)
+            if not name:
+                die("không suy ra được tên profile, truyền tên: codex-switch save <name>")
+
+        out = self.profile_path(name)
+        existing = load_json(out)
+        saved_alias = alias or existing.get("alias")
+
+        write_json(out, {
+            "name": name,
+            "alias": saved_alias,
+            "email": info.get("email"),
+            "account_id": info.get("account_id"),
+            "user_id": info.get("user_id"),
+            "plan": info.get("plan"),
+            "auth_mode": info.get("auth_mode"),
+            "account_name": info.get("account_name"),
+            "credentials": raw_auth,
+            "savedAt": int(time.time()),
+        })
+        if not quiet:
+            ok(f"Đã lưu profile Codex '{name}'" + (f" (alias: {saved_alias})" if saved_alias else ""))
+
+    def restart_daemon(self) -> bool:
+        """Restart app-server daemon của Codex để nó nạp lại auth.json.
+
+        Daemon sống sau khi đóng CLI/VS Code và giữ token cũ trong bộ nhớ, nên chỉ ghi
+        auth.json thì mọi session qua daemon vẫn bị 401. Chỉ chạm daemon của chính $CODEX_HOME này.
+        """
+        if not (self.codex_home / "app-server-daemon").exists():
+            return False
+        try:
+            r = subprocess.run(["codex", "app-server", "daemon", "restart"],
+                               capture_output=True, timeout=30, env={**os.environ, "CODEX_HOME": str(self.codex_home)})
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0
+
+    def use(self, query: str):
+        """Chuyển sang một profile Codex."""
+        if not query:
+            die("Usage: codex-switch switch <name|alias|email>")
+        name = self.resolve_profile_name(query)
+        if not name:
+            die(f"không tìm thấy profile Codex phù hợp với '{query}'. Xem: codex-switch list")
+
+        src = self.profile_path(name)
+        prof = load_json(src)
+        creds = prof.get("credentials")
+        if not creds:
+            die(f"profile '{name}' không có credential hợp lệ")
+
+        # Auto-save tài khoản Codex đang dùng nếu đã thay đổi
+        cur = self.current_profile()
+        if cur and cur != name:
+            self.save(cur, quiet=True)
+            print(f"[..] Đã cập nhật profile hiện tại: {cur}")
+            self.prev_file.write_text(cur)
+        elif not cur and self.auth_file.exists():
+            print("[!] Tài khoản Codex đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
+                  "    Huỷ (Ctrl-C) rồi chạy: codex-switch save <name>")
+
+        self.backup_auth()
+        write_json(self.auth_file, creds)
+        self.state_file.write_text(name)
+
+        ok(f"Đã chuyển sang tài khoản Codex '{name}'")
+        if self.restart_daemon():
+            print("    Đã restart app-server daemon của Codex — mở lại session để nhận tài khoản mới.")
+            return
+        n = process_count("codex")
+        print(f"    Đang có {n} tiến trình codex chạy bằng token cũ — khởi động lại Codex CLI / VS Code / Codex App để nhận tài khoản mới."
+              if n else "    Khởi động lại Codex client (CLI / VS Code / App) để áp dụng tài khoản mới.")
+
+    def switch_prev(self):
+        """Chuyển về tài khoản Codex trước đó (chức năng `codex-auth switch -`)."""
+        if not self.prev_file.exists():
+            die("Chưa ghi nhận tài khoản Codex trước đó để chuyển")
+        prev = self.prev_file.read_text().strip()
+        if not prev or not self.profile_path(prev).exists():
+            die(f"Tài khoản trước đó '{prev}' không còn tồn tại")
+        self.use(prev)
+
+    def next(self):
+        """Chuyển sang profile Codex tiếp theo theo vòng tròn alphabet."""
+        names = self.profile_names()
+        if not names:
+            die("chưa có profile nào")
+        last = self.current_profile() or (self.state_file.read_text().strip() if self.state_file.exists() else "")
+        idx = names.index(last) if last in names else -1
+        self.use(names[(idx + 1) % len(names)])
+
+    def remove(self, *queries: str, all_profiles: bool = False):
+        """Xoá profile Codex (một, nhiều profile, hoặc tất cả)."""
+        if all_profiles or (queries and queries[0] == "--all"):
+            names = self.profile_names()
+            if not names:
+                print("Không có profile nào để xoá.")
+                return
+            for n in names:
+                self.profile_path(n).unlink(missing_ok=True)
+            self.state_file.unlink(missing_ok=True)
+            self.prev_file.unlink(missing_ok=True)
+            ok(f"Đã xoá toàn bộ {len(names)} profile Codex")
+            return
+
+        if not queries:
+            die("Usage: codex-switch remove <name|alias|email>... hoặc codex-switch remove --all")
+        for q in queries:
+            name = self.resolve_profile_name(q)
+            if not name:
+                die(f"không tìm thấy profile Codex '{q}'")
+            self.profile_path(name).unlink(missing_ok=True)
+            if self.state_file.exists() and self.state_file.read_text().strip() == name:
+                self.state_file.unlink(missing_ok=True)
+            if self.prev_file.exists() and self.prev_file.read_text().strip() == name:
+                self.prev_file.unlink(missing_ok=True)
+            ok(f"Đã xoá profile Codex '{name}'")
+
+    def alias_set(self, query: str, alias: str):
+        """Đặt alias cho profile Codex (tham khảo `codex-auth alias set`)."""
+        if not query or not alias:
+            die("Usage: codex-switch alias set <query> <alias>")
+        if not NAME_RE.match(alias):
+            die(f"Tên alias không hợp lệ: '{alias}'")
+        name = self.resolve_profile_name(query)
+        if not name:
+            die(f"không tìm thấy profile Codex '{query}'")
+        p = load_json(self.profile_path(name))
+        p["alias"] = alias
+        write_json(self.profile_path(name), p)
+        ok(f"Đã gán alias '{alias}' cho profile '{name}'")
+
+    def alias_clear(self, query: str):
+        """Xoá alias của profile Codex (tham khảo `codex-auth alias clear`)."""
+        if not query:
+            die("Usage: codex-switch alias clear <query>")
+        name = self.resolve_profile_name(query)
+        if not name:
+            die(f"không tìm thấy profile Codex '{query}'")
+        p = load_json(self.profile_path(name))
+        p["alias"] = None
+        write_json(self.profile_path(name), p)
+        ok(f"Đã xoá alias của profile '{name}'")
+
+    def login(self, device_auth: bool = False):
+        """Gọi `codex login` rồi tự động lưu tài khoản (tham khảo `codex-auth login`)."""
+        cmd = ["codex", "login"]
+        if device_auth:
+            cmd.append("--device-auth")
+        print(f"[*] Thực thi: {' '.join(cmd)}")
+        try:
+            r = subprocess.run(cmd)
+            if r.returncode != 0:
+                die(f"codex login thất bại với mã thoát {r.returncode}")
+        except FileNotFoundError:
+            die("không tìm thấy lệnh `codex` trong PATH. Cài đặt bằng: npm install -g @openai/codex")
+        # Đọc kết quả và lưu profile
+        self.save()
+
+    def export(self, dir_path: str = ""):
+        """Xuất các credential thành file auth.json (tham khảo `codex-auth export`)."""
+        out_dir = Path(dir_path) if dir_path else self.export_dir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        names = self.profile_names()
+        if not names:
+            print("Không có profile nào để xuất.")
+            return
+        count = 0
+        for n in names:
+            p = load_json(self.profile_path(n))
+            creds = p.get("credentials")
+            if creds:
+                target = out_dir / f"{n}.auth.json"
+                write_json(target, creds)
+                count += 1
+        ok(f"Đã xuất {count} profile Codex vào {out_dir}")
+
+    def import_auth(self, target_path: str):
+        """Nhập profile từ file hoặc thư mục *.auth.json (tham khảo `codex-auth import`)."""
+        if not target_path:
+            die("Usage: codex-switch import <file|dir>")
+        p = Path(target_path)
+        if not p.exists():
+            die(f"đường dẫn không tồn tại: {target_path}")
+
+        files = list(p.glob("*.json")) if p.is_dir() else [p]
+        imported = 0
+        for f in files:
+            data = load_json(f)
+            info = self.parse_auth_info(data)
+            if not info:
+                continue
+            name = f.stem.replace(".auth", "")
+            if not NAME_RE.match(name):
+                name = self.name_from_info(info)
+            write_json(self.profile_path(name), {
+                "name": name,
+                "alias": None,
+                "email": info.get("email"),
+                "account_id": info.get("account_id"),
+                "user_id": info.get("user_id"),
+                "plan": info.get("plan"),
+                "auth_mode": info.get("auth_mode"),
+                "credentials": data,
+                "savedAt": int(time.time()),
+            })
+            imported += 1
+        if p.is_file() and imported == 0:
+            die(f"file '{target_path}' không chứa thông tin xác thực Codex hợp lệ")
+        ok(f"Đã nhập thành công {imported} profile Codex")
+
+    def load_rows(self) -> list:
+        """Nạp danh sách thông tin hiển thị các profile Codex."""
+        cur = self.current_profile()
+        rows = []
+        for n in self.profile_names():
+            p = load_json(self.acc_dir / f"{n}.json")
+            if not p:
+                continue
+            rows.append({
+                "name": n,
+                "cur": n == cur,
+                "alias": p.get("alias") or "",
+                "email": p.get("email") or "?",
+                "plan": p.get("plan") or "Unknown",
+                "auth_mode": p.get("auth_mode") or "chatgpt",
+                "saved": p.get("savedAt"),
+            })
+        return rows
+
+    def list(self):
+        """Liệt kê các profile Codex."""
+        rows = self.load_rows()
+        if not rows:
+            print("Chưa có profile Codex nào. Lưu tài khoản hiện tại: codex-switch save <name>")
+            return
+        print("%-2s %-14s %-12s %-30s %-10s %s" % ("", "PROFILE", "ALIAS", "EMAIL", "PLAN", "AUTH"))
+        for r in rows:
+            mark = "*" if r["cur"] else " "
+            print("%-2s %-14s %-12s %-30s %-10s %s" % (
+                mark, r["name"], r["alias"], r["email"], r["plan"], r["auth_mode"]))
+
+    def status(self):
+        """Xem tài khoản Codex đang đăng nhập."""
+        cur = self.current_profile()
+        info = self.current_auth_info()
+        if cur:
+            alias_str = f" (alias: {load_json(self.profile_path(cur)).get('alias')})" if load_json(self.profile_path(cur)).get("alias") else ""
+            ok(f"Đang dùng: {cur}{alias_str} · {info.get('email')} [{info.get('plan')}]")
+        elif info.get("email"):
+            print(f"[?] Đang đăng nhập tài khoản Codex chưa lưu: {info.get('email')} [{info.get('plan')}]")
+        else:
+            print("[?] Chưa đăng nhập Codex")
+
+    def doctor(self):
+        """Kiểm tra sức khoẻ cấu hình Codex."""
+        bad = 0
+
+        def line(level, msg):
+            nonlocal bad
+            print({"ok": "[OK]   ", "warn": "[!]    ", "err": "[ERROR]"}[level], msg)
+            bad += level == "err"
+
+        if os.environ.get("OPENAI_API_KEY"):
+            line("warn", "biến OPENAI_API_KEY đang đặt — nó có thể ghi đè token trong auth.json")
+        line("ok" if self.auth_file.exists() else "warn",
+             f"auth file: {self.auth_file}" + (" (tồn tại)" if self.auth_file.exists() else " (chưa có — cần đăng nhập)"))
+        if self.acc_dir.exists() and (self.acc_dir.stat().st_mode & 0o077):
+            line("err", f"{self.acc_dir} cho phép nhóm/người khác truy cập — chạy: chmod 700 {self.acc_dir}")
+
+        acc_ids = {}
+        for n in self.profile_names():
+            f = self.acc_dir / f"{n}.json"
+            if f.stat().st_mode & 0o077:
+                line("err", f"profile '{n}' chứa credential nhưng không phải chmod 600")
+            try:
+                p = json.loads(f.read_text())
+                assert p.get("credentials")
+            except Exception:
+                line("err", f"profile '{n}' hỏng hoặc thiếu trường")
+                continue
+            aid = p.get("account_id") or p.get("email")
+            if aid:
+                acc_ids.setdefault(aid, []).append(n)
+
+        for names in acc_ids.values():
+            if len(names) > 1:
+                line("warn", f"các profile {', '.join(names)} là cùng một tài khoản Codex")
+
+        n = process_count("codex")
+        if n:
+            line("ok", f"{n} tiến trình codex đang chạy (khởi động lại sau khi switch)")
+
+        print("\nKhông phát hiện lỗi Codex." if not bad else f"\n{bad} lỗi Codex cần sửa.")
+        sys.exit(1 if bad else 0)
+
+
+# ==============================================================================
+# 3. REGISTRY & MULTI-CLIENT ORCHESTRATOR
+# ==============================================================================
+
+CLIENTS = {
+    "claude": ClaudeClient(),
+    "codex": CodexClient(),
+}
+
+
+def get_default_client_id() -> str:
+    """Lấy client mặc định từ cấu hình ~/.agents-switch/.current_client (mặc định 'claude')."""
+    if DEFAULT_CLIENT_FILE.exists():
+        c = DEFAULT_CLIENT_FILE.read_text().strip()
+        if c in CLIENTS:
+            return c
+    return "claude"
+
+
+def set_default_client_id(client_id: str):
+    """Đặt client mặc định cho agents-switch."""
+    if client_id not in CLIENTS:
+        die(f"Client '{client_id}' không được hỗ trợ. Khả dụng: {', '.join(CLIENTS.keys())}")
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_CLIENT_FILE.write_text(client_id)
+    ok(f"Đã đặt client mặc định là '{client_id}'")
+
+
+def cmd_clients():
+    """Liệt kê tất cả các AI agent clients được hỗ trợ và trạng thái hiện tại."""
+    print(f"agents-switch v{VERSION} — Hỗ trợ đa client AI coding agents:\n")
+    print("%-2s %-10s %-16s %-14s %s" % ("", "CLIENT", "TÊN", "TRẠNG THÁI", "TÀI KHOẢN ĐANG DÙNG"))
+    def_id = get_default_client_id()
+    for cid, c in CLIENTS.items():
+        is_def = "*" if cid == def_id else " "
+        installed = "Có file auth" if (hasattr(c, "auth_file") and c.auth_file.exists()) or (hasattr(c, "config_file") and c.config_file.exists()) else "Chưa đăng nhập"
+        cur = c.current_profile()
+        who = cur or "(chưa lưu)" if (hasattr(c, "current_uuid") and c.current_uuid()) or (hasattr(c, "current_auth_info") and c.current_auth_info().get("email")) else "chưa đăng nhập"
+        print("%-2s %-10s %-16s %-14s %s" % (is_def, cid, c.NAME, installed, who))
+    print(f"\nClient mặc định đánh dấu '*'. Đổi client mặc định: agents-switch client <name>")
+
+
+def cmd_status_all():
+    """Xem trạng thái đăng nhập trên tất cả các clients."""
+    print("Trạng thái đăng nhập các AI Coding Agents:\n")
+    for cid, c in CLIENTS.items():
+        cur = c.current_profile()
+        if cid == "claude":
+            if cur:
+                cfg = c.load_config()
+                email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+                org = cfg.get("oauthAccount", {}).get("organizationName", "")
+                extra = f" ({email}" + (f" · {org}" if org else "") + ")" if email else ""
+                print(f"  ● Claude Code:   {cur}{extra}")
+            elif c.current_uuid():
+                cfg = c.load_config()
+                email = cfg.get("oauthAccount", {}).get("emailAddress", "")
+                extra = f" ({email})" if email else ""
+                print(f"  ○ Claude Code:   Đang đăng nhập{extra} (chưa lưu thành profile)")
+            else:
+                print(f"  - Claude Code:   Chưa đăng nhập")
+        elif cid == "codex":
+            info = c.current_auth_info()
+            if cur:
+                print(f"  ● OpenAI Codex:  {cur} ({info.get('email')} · {info.get('plan')})")
+            elif info.get("email"):
+                print(f"  ○ OpenAI Codex:  Đang đăng nhập {info.get('email')} (chưa lưu)")
+            else:
+                print(f"  - OpenAI Codex:  Chưa đăng nhập")
+
+
+def cmd_doctor_all():
+    """Kiểm tra sức khoẻ cấu hình của toàn bộ clients."""
+    print(f"=== Kiểm tra hệ thống agents-switch v{VERSION} ===\n")
+    has_errors = False
+    for cid, c in CLIENTS.items():
+        print(f"--- Client: {c.NAME} ({cid}) ---")
+        try:
+            c.doctor()
+        except SystemExit as e:
+            if e.code:
+                has_errors = True
+        print()
+    if has_errors:
+        sys.exit(1)
+
+
+# ==============================================================================
+# 4. GIAO DIỆN TƯƠNG TÁC (TUI CURSES) ĐA CLIENT
+# ==============================================================================
+
+def _age(ts) -> str:
+    if not ts:
+        return "?"
+    s = max(0, time.time() - ts)
+    return "%dm" % (s / 60) if s < 3600 else "%dh" % (s / 3600) if s < 172800 else "%dd" % (s / 86400)
+
+
+def _resets(u: dict) -> str:
+    r = (u.get("seven_day") or {}).get("resets_at")
+    try:
+        return datetime.fromisoformat(r).astimezone().strftime("%d/%m %H:%M")
+    except Exception:
+        return ""
+
+
+def _cursor(visible: bool):
+    try:
+        curses.curs_set(1 if visible else 0)
+    except curses.error:
+        pass
+
+
+def run_quiet(fn, *args, raw=False):
+    """Chạy một lệnh mà không in ra console, bắt output trả về cho TUI."""
+    buf, good = io.StringIO(), True
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            fn(*args)
+        except SystemExit as e:
+            good = not e.code
+        except Exception as e:
+            good = False
+            print(f"[ERROR] {e}")
+    lines = [l.rstrip() for l in buf.getvalue().splitlines()]
+    if raw:
+        return good, lines
+    return good, [re.sub(r"^\[[^\]]*\]\s*", "", l.strip()) for l in lines if l.strip()]
+
+
+def _ui(scr, client_lock: str = None):
+    """Vòng lặp giao diện tương tác Curses đa năng.
+    
+    Nếu client_lock == 'claude': Giao diện giữ nguyên 100% menu và banner như claude-switch.
+    Nếu client_lock == 'codex': Giao diện tối ưu cho Codex.
+    Nếu client_lock == None: Cho phép chuyển đổi linh hoạt giữa các client bằng phím Tab hoặc 'c'.
+    """
+    _cursor(False)
+    colors = {k: 0 for k in ("ok", "warn", "bad", "accent")}
+    if curses.has_colors() and not os.environ.get("NO_COLOR"):
+        curses.start_color()
+        curses.use_default_colors()
+        for i, (k, col) in enumerate((("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW),
+                                      ("bad", curses.COLOR_RED), ("accent", curses.COLOR_CYAN)), 1):
+            curses.init_pair(i, col, -1)
+            colors[k] = curses.color_pair(i)
+    else:
+        colors["warn"] = colors["bad"] = curses.A_BOLD
+
+    try:
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+    except curses.error:
+        pass
+
+    utf = "utf" in locale.getpreferredencoding(False).lower()
+    FULL, EMPTY, DOT, OFF, ARROW, LOGO = (
+        ("█", "░", "●", "○", "▸", "⇄") if utf else ("#", "-", "*", "o", ">", "<>"))
+    BOLD, DIM, REV = curses.A_BOLD, curses.A_DIM, curses.A_REVERSE
+
+    # Trạng thái hiện tại
+    active_cid = client_lock or get_default_client_id()
+    client = CLIENTS[active_cid]
+
+    S = {
+        "client_id": active_cid,
+        "rows": client.load_rows(),
+        "sel": 0, "top": 0, "msel": 0, "msg": (True, []),
+        "prompt": None, "hits": [], "draw": None
+    }
+
+    def switch_client(new_cid: str):
+        nonlocal client
+        if new_cid in CLIENTS:
+            S["client_id"] = new_cid
+            client = CLIENTS[new_cid]
+            S["rows"] = client.load_rows()
+            S["sel"] = 0
+            S["msel"] = 0
+            S["msg"] = (True, [f"Đã chuyển sang client: {client.NAME}"])
+
+    def get_menu():
+        """Tạo danh sách menu phù hợp theo client đang chọn."""
+        cid = S["client_id"]
+        if client_lock == "claude" or cid == "claude":
+            menu = [
+                ("1", "Chuyển tài khoản", "chọn profile rồi chuyển", "switch"),
+                ("2", "Tài khoản kế tiếp", "chuyển vòng tròn sang profile sau", "next"),
+                ("3", "Lưu tài khoản hiện tại", "thành profile mới hoặc cập nhật", "save"),
+                ("4", "Quota & usage", "5H / 7 ngày của mọi profile", "usage"),
+                ("5", "Đồng bộ session", "gộp sidebar Desktop, chọn từng cái", "sync"),
+                ("6", "Xoá profile", "chọn profile cần xoá", "remove"),
+                ("7", "Kiểm tra cấu hình", "quyền file, biến ghi đè, profile hỏng", "doctor"),
+                ("8", "Trợ giúp", "phím tắt và cách hoạt động", "help"),
+            ]
+            if not client_lock:
+                menu.append(("c", "Đổi client", "chuyển sang OpenAI Codex", "toggle_client"))
+            menu.append(("q", "Thoát", "", "quit"))
+            return menu
+        else:
+            # Client: Codex
+            menu = [
+                ("1", "Chuyển tài khoản", "chọn profile Codex rồi chuyển", "switch"),
+                ("2", "Tài khoản kế tiếp", "chuyển vòng tròn sang profile sau", "next"),
+                ("3", "Tài khoản trước đó", "chuyển về tài khoản gần nhất (switch -)", "switch_prev"),
+                ("4", "Lưu tài khoản hiện tại", "lưu auth.json thành profile", "save"),
+                ("5", "Quản lý Alias", "gán hoặc xoá alias tài khoản", "alias"),
+                ("6", "Xoá profile", "chọn profile Codex cần xoá", "remove"),
+                ("7", "Kiểm tra cấu hình", "kiểm tra quyền file, biến môi trường", "doctor"),
+                ("8", "Trợ giúp", "phím tắt và cách hoạt động", "help"),
+            ]
+            if not client_lock:
+                menu.append(("c", "Đổi client", "chuyển sang Claude Code", "toggle_client"))
+            menu.append(("q", "Thoát", "", "quit"))
+            return menu
+
+    def put(y, x, text, attr=0):
+        h, w = scr.getmaxyx()
+        if 0 <= y < h and 0 <= x < w:
+            try:
+                scr.addstr(y, x, text[: w - x - (y == h - 1)], attr)
+            except curses.error:
+                pass
+
+    def fit(text, w):
+        return (text if len(text) <= w else text[: w - 1] + "…").ljust(w)
+
+    def rule(y, w):
+        put(y, 0, ("─" if utf else "-") * w, DIM)
+
+    def center(y, w, parts):
+        x = max(0, (w - sum(len(t) for t, _ in parts)) // 2)
+        for t, a in parts:
+            put(y, x, t, a)
+            x += len(t)
+
+    def quota(u, key):
+        p = (u.get(key) or {}).get("utilization")
+        if p is None:
+            return "?".ljust(11), 0
+        n = round(min(p, 100) / 100 * 6)
+        attr = colors["ok"] if p < 60 else colors["warn"] if p < 85 else colors["bad"]
+        return FULL * n + EMPTY * (6 - n) + " %3d%%" % p, attr
+
+    def frame(min_h=9, min_w=48):
+        scr.erase()
+        S["hits"] = []
+        h, w = scr.getmaxyx()
+        if h < min_h or w < min_w:
+            put(0, 0, f"Terminal quá nhỏ (cần ≥ {min_w}x{min_h})")
+            scr.refresh()
+            return None
+        return h, w
+
+    def footer(h, hints):
+        x = 1
+        for key, label, val in hints:
+            put(h - 1, x, key, colors["accent"] | BOLD)
+            put(h - 1, x + len(key) + 1, label, DIM)
+            w = len(key) + 1 + len(label)
+            if val is not None:
+                S["hits"].append((h - 1, x, x + w, val))
+            x += w + 3
+
+    def bottom(h, w, hints):
+        rule(h - 4, w)
+        cursor = False
+        if S["prompt"]:
+            text, buf = S["prompt"]
+            put(h - 3, 1, text + (buf or ""), colors["warn"] | BOLD)
+            if buf is not None:
+                scr.move(h - 3, min(w - 1, 1 + len(text) + len(buf)))
+                cursor = True
+        else:
+            good, lines = S["msg"]
+            for i, line in enumerate(lines[-2:]):
+                mark = ("✔ " if good else "✘ ") if i == 0 and utf else "  "
+                put(h - 3 + i, 1, mark + line, colors["ok" if good else "bad"] if i == 0 else DIM)
+        footer(h, hints)
+        _cursor(cursor)
+        scr.refresh()
+
+    def draw_home():
+        f = frame(15, 48)
+        if not f:
+            return
+        h, w = f
+        rows = S["rows"]
+        cur = next((r for r in rows if r["cur"]), None)
+        avail = h - 4
+        compact = avail < 15
+        menu = get_menu()
+        total = (1 if compact else 2) + (0 if compact else 1) + (1 if compact else 2) \
+            + (0 if compact else 1) + len(menu)
+        y = max(0, (avail - total) // 2)
+
+        # Tiêu đề banner: tuỳ theo chế độ claude-switch hay agents-switch
+        if client_lock == "claude":
+            title = f"{LOGO}  claude-switch"
+            subtitle = f"chuyển đổi nhiều tài khoản Claude Code · v{VERSION}"
+        elif client_lock == "codex":
+            title = f"{LOGO}  codex-switch"
+            subtitle = f"chuyển đổi nhiều tài khoản OpenAI Codex · v{VERSION}"
+        else:
+            title = f"{LOGO}  agents-switch"
+            subtitle = f"chuyển đổi tài khoản AI Coding Agents · v{VERSION}"
+
+        center(y, w, [(title, colors["accent"] | BOLD)])
+        y += 1
+        if not compact:
+            center(y, w, [(subtitle, DIM)])
+            y += 2
+
+        # Header hiển thị thông tin tài khoản đang active
+        cid = S["client_id"]
+        if not client_lock:
+            client_tag = f"[ Client: {client.NAME} ]  (Tab / c: đổi)"
+            center(y - 1, w, [(client_tag, colors["accent"])])
+
+        if cur:
+            desc = cur['email']
+            if cid == "codex" and cur.get("plan"):
+                desc += f"  ({cur['plan']})"
+            center(y, w, [(f"{DOT} {cur['name']}", colors["ok"] | BOLD), (f"  ·  {desc}", 0)])
+            if not compact and cid == "claude" and cur.get("usage"):
+                q5, a5 = quota(cur["usage"], "five_hour")
+                q7, a7 = quota(cur["usage"], "seven_day")
+                center(y + 1, w, [("5H ", DIM), (q5, a5), ("    7D ", DIM), (q7, a7)])
+        else:
+            center(y, w, [(f"{OFF} tài khoản đang dùng chưa được lưu hoặc chưa đăng nhập", colors["warn"])])
+            if not compact:
+                center(y + 1, w, [(f"chọn «Lưu tài khoản hiện tại» để lưu vào profile {client.NAME}", DIM)])
+
+        y += 1 if compact else 3
+
+        mw = min(w - 4, 70)
+        x0 = (w - mw) // 2
+        for i, (key, label, desc, _) in enumerate(menu):
+            yy, sel = y + i, i == S["msel"]
+            base = REV if sel else 0
+            if sel:
+                put(yy, x0, " " * mw, base)
+            put(yy, x0 + 1, ARROW if sel else " ", base | colors["accent"])
+            put(yy, x0 + 3, key, base | colors["accent"] | BOLD)
+            put(yy, x0 + 6, fit(label, 24), base | (BOLD if sel else 0))
+            if mw >= 52:
+                put(yy, x0 + 31, fit(desc, mw - 32), base | DIM)
+            S["hits"].append((yy, x0, x0 + mw, key))
+
+        home_hints = [("↑↓", "chọn", None), ("1-8", "mở nhanh", None), ("⏎", "mở", "\n")]
+        if not client_lock:
+            home_hints.append(("Tab", "đổi client", "\t"))
+        home_hints.extend([("?", "trợ giúp", "?"), ("q", "thoát", "q")])
+        bottom(h, w, home_hints)
+
+    def draw_table(mode):
+        f = frame()
+        if not f:
+            return
+        h, w = f
+        rows = S["rows"]
+        cur = next((r for r in rows if r["cur"]), None)
+        title_text = {
+            "switch": f"Chuyển tài khoản ({client.NAME})",
+            "remove": f"Xoá profile ({client.NAME})",
+            "usage": f"Quota & usage ({client.NAME})"
+        }.get(mode, "Danh sách")
+        put(0, 1, title_text, colors["accent"] | BOLD)
+        if cur:
+            who, attr = f"{DOT} {cur['name']} ", colors["ok"] | BOLD
+        else:
+            who, attr = f"{OFF} chưa lưu ", colors["warn"]
+        put(0, w - len(who), who, attr)
+        rule(1, w)
+
+        nw = min(16, max([7] + [len(r["name"]) for r in rows]))
+        ew = min(30, max([8] + [len(r["email"]) for r in rows]))
+
+        if S["client_id"] == "claude":
+            ow = min(22, max([3] + [len(r.get("org", "")) for r in rows]))
+            cols = [["org", ow], ["saved", 5], ["reset", 11]]
+            width = lambda: 3 + nw + 1 + ew + 1 + 24 + sum(c + 1 for _, c in cols)
+            while cols and width() > w - 1:
+                cols.pop(0)
+            shown = {k for k, _ in cols}
+
+            x = 3
+            for label, cw, on in (("PROFILE", nw, 1), ("EMAIL", ew, 1), ("ORG", ow, "org" in shown),
+                                  ("5H", 12, 1), ("7D", 12, 1), ("7D RESET", 11, "reset" in shown),
+                                  ("SAVED", 5, "saved" in shown)):
+                if on:
+                    put(2, x, label, DIM | BOLD)
+                    x += cw + 1
+        else:
+            # Client: Codex
+            aw = min(12, max([5] + [len(r.get("alias", "")) for r in rows]))
+            pw = min(12, max([4] + [len(r.get("plan", "")) for r in rows]))
+            put(2, 3, "PROFILE".ljust(nw), DIM | BOLD)
+            put(2, 4 + nw, "ALIAS".ljust(aw), DIM | BOLD)
+            put(2, 5 + nw + aw, "EMAIL".ljust(ew), DIM | BOLD)
+            put(2, 6 + nw + aw + ew, "PLAN".ljust(pw), DIM | BOLD)
+
+        vis = h - 7
+        S["sel"] = max(0, min(S["sel"], len(rows) - 1))
+        S["top"] = max(0, min(S["top"], S["sel"]), S["sel"] - vis + 1)
+        if not rows:
+            put(4, 3, f"Chưa có profile {client.NAME}. Về menu chính → «Lưu tài khoản hiện tại».", DIM)
+
+        for i, r in enumerate(rows[S["top"]: S["top"] + vis]):
+            y, sel = 3 + i, S["top"] + i == S["sel"]
+            base = REV if sel else 0
+            if sel:
+                put(y, 0, " " * w, base)
+            S["hits"].append((y, 0, w, ("row", S["top"] + i)))
+            put(y, 1, ARROW if sel else " ", base | colors["accent"])
+            put(y, 2, DOT if r["cur"] else " ", base | colors["ok"])
+            x = 3
+            put(y, x, fit(r["name"], nw), base | (BOLD if r["cur"] else 0))
+            x += nw + 1
+
+            if S["client_id"] == "claude":
+                put(y, x, fit(r["email"], ew), base)
+                x += ew + 1
+                if "org" in shown:
+                    put(y, x, fit(r.get("org", ""), ow), base | DIM)
+                    x += ow + 1
+                for key in ("five_hour", "seven_day"):
+                    text, qa = quota(r.get("usage", {}), key)
+                    put(y, x, text, base | qa)
+                    x += 12
+                if "reset" in shown:
+                    put(y, x, fit(_resets(r.get("usage", {})), 11), base | DIM)
+                    x += 12
+                if "saved" in shown:
+                    put(y, x, fit("live" if r.get("live") else _age(r.get("saved")), 5), base | DIM)
+            else:
+                # Codex
+                put(y, x, fit(r.get("alias", ""), aw), base | DIM)
+                x += aw + 1
+                put(y, x, fit(r["email"], ew), base)
+                x += ew + 1
+                put(y, x, fit(r.get("plan", ""), pw), base | colors["accent"])
+
+        hints = [("↑↓", "chọn", None), ("⏎", "thực hiện", "\n"), ("s", "lưu", "s"),
+                 ("d", "xoá", "d"), ("esc", "quay lại", "\x1b")]
+        bottom(h, w, hints)
+
+    def getkey():
+        while True:
+            try:
+                k = scr.get_wch()
+            except curses.error:
+                continue
+            if k != curses.KEY_MOUSE:
+                return k
+            try:
+                _, mx, my, _, b = curses.getmouse()
+            except curses.error:
+                continue
+            if b & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                for y, x0, x1, val in S["hits"]:
+                    if y == my and x0 <= mx < x1:
+                        return val
+            elif b & getattr(curses, "BUTTON4_PRESSED", 0):
+                return curses.KEY_UP
+            elif b & getattr(curses, "BUTTON5_PRESSED", 0):
+                return curses.KEY_DOWN
+
+    def confirm(text, keys):
+        S["prompt"] = (text, None)
+        try:
+            while True:
+                S["draw"]()
+                k = getkey()
+                if k == "\x1b":
+                    return None
+                if isinstance(k, str) and k.lower() in keys:
+                    return k.lower()
+        finally:
+            S["prompt"] = None
+
+    def ask(text):
+        buf = ""
+        try:
+            while True:
+                S["prompt"] = (text, buf)
+                S["draw"]()
+                k = getkey()
+                if k == "\x1b":
+                    return None
+                if k in ("\n", "\r", curses.KEY_ENTER):
+                    return buf.strip()
+                if k in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    buf = buf[:-1]
+                elif isinstance(k, str) and k.isprintable():
+                    buf += k
+        finally:
+            S["prompt"] = None
+
+    def say(good, lines):
+        S["msg"] = (good, lines)
+        S["rows"] = client.load_rows()
+
+    def do_save() -> bool:
+        name = ask("Tên profile (để trống = tự sinh từ email): ")
+        if name is None:
+            return False
+        if name and not NAME_RE.match(name):
+            say(False, [f"Tên không hợp lệ: '{name}' (chỉ cho phép chữ, số, . _ -)"])
+            return False
+        good, lines = run_quiet(client.save, name)
+        say(good, lines)
+        return good
+
+    def guard() -> bool:
+        cid = S["client_id"]
+        if cid == "claude":
+            if client.current_uuid() and not client.current_profile():
+                k = confirm("Tài khoản đang đăng nhập chưa lưu.  [s] lưu rồi chuyển  [c] chuyển luôn  [Esc] huỷ ", "sc")
+                if k is None or (k == "s" and not do_save()):
+                    return False
+        elif cid == "codex":
+            if client.auth_file.exists() and not client.current_profile():
+                k = confirm("Tài khoản Codex hiện tại chưa lưu.  [s] lưu rồi chuyển  [c] chuyển luôn  [Esc] huỷ ", "sc")
+                if k is None or (k == "s" and not do_save()):
+                    return False
+        return True
+
+    def do_switch(name) -> bool:
+        if not guard():
+            return False
+        say(*run_quiet(client.use, name))
+        return True
+
+    def do_remove(name):
+        if confirm(f"Xoá profile '{name}'? [y/N] ", "yn") == "y":
+            say(*run_quiet(client.remove, name))
+
+    def pick_profile(mode):
+        S["sel"] = next((i for i, r in enumerate(S["rows"]) if r["cur"]), 0) if mode == "switch" else 0
+        while True:
+            S["draw"] = lambda: draw_table(mode)
+            S["draw"]()
+            k = getkey()
+            rows, n = S["rows"], len(S["rows"])
+            if isinstance(k, tuple):
+                if k[1] != S["sel"]:
+                    S["sel"] = k[1]
+                    continue
+                k = "\n"
+            if k in ("q", "\x1b"):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                S["sel"] = max(0, S["sel"] - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                S["sel"] = min(n - 1, S["sel"] + 1)
+            elif k in ("\n", "\r", curses.KEY_ENTER) and n:
+                if mode == "switch" and do_switch(rows[S["sel"]]["name"]):
+                    return
+                if mode == "remove":
+                    do_remove(rows[S["sel"]]["name"])
+                    if not S["rows"]:
+                        return
+            elif k == "s" and mode == "switch":
+                do_save()
+            elif k == "d" and mode == "switch" and n:
+                do_remove(rows[S["sel"]]["name"])
+
+    def show_text(title, lines):
+        top = 0
+        while True:
+            f = frame()
+            if f:
+                h, w = f
+                vis = h - 4
+                top = max(0, min(top, len(lines) - vis))
+                put(0, 1, title, colors["accent"] | BOLD)
+                rule(1, w)
+                for i, line in enumerate(lines[top: top + vis]):
+                    attr = (colors["ok"] if line.startswith("[OK]") else
+                            colors["warn"] if line.startswith("[!]") else
+                            colors["bad"] if line.startswith("[ERROR]") else 0)
+                    put(2 + i, 2, line, attr)
+                rule(h - 2, w)
+                footer(h, [("↑↓", "cuộn", None), ("esc", "quay lại", "\x1b")])
+                scr.refresh()
+            k = getkey()
+            if k in ("\x1b", "q", "\n", "\r", curses.KEY_ENTER):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                top = max(0, top - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                top += 1
+
+    def do_sessions():
+        if S["client_id"] != "claude":
+            say(False, ["Đồng bộ session chỉ hỗ trợ cho Claude Code Desktop"])
+            return
+        got = {}
+        good, lines = run_quiet(lambda: got.update(v=client.session_candidates()))
+        if not good:
+            say(False, lines)
+            return
+        dst, cands = got["v"]
+        items = [c for c in cands if c["dst_ts"] is None]
+        if not items:
+            say(True, ["Không có session nào cần gộp"])
+            return
+        chosen, cur_i, top = set(), 0, 0
+        while True:
+            f = frame()
+            if f:
+                h, w = f
+                vis = max(1, h - 4)
+                top = max(0, min(top, cur_i), cur_i - vis + 1)
+                count = f"{len(chosen)}/{len(items)} đã chọn"
+                put(0, 1, "Đồng bộ session về tài khoản đang dùng", colors["accent"] | BOLD)
+                put(0, max(0, w - len(count) - 1), count, DIM)
+                rule(1, w)
+                tw = max(10, w - 40)
+                for i, c in enumerate(items[top: top + vis]):
+                    idx = top + i
+                    base = REV if idx == cur_i else 0
+                    if base:
+                        put(2 + i, 0, " " * w, base)
+                    S["hits"].append((2 + i, 0, w, ("row", idx)))
+                    put(2 + i, 1, ("[x] " if idx in chosen else "[ ] ") + "%-5s" % _age(c["ts"]),
+                        base | (colors["ok"] if idx in chosen else 0))
+                    put(2 + i, 12, fit(c["title"], tw), base)
+                    put(2 + i, 13 + tw, fit(c["src"], 14), base | DIM)
+                rule(h - 2, w)
+                footer(h, [("↑↓", "chọn", None), ("space", "đánh dấu", " "), ("a", "tất cả", "a"),
+                           ("⏎", "gộp", "\n"), ("esc", "quay lại", "\x1b")])
+                scr.refresh()
+            k = getkey()
+            if isinstance(k, tuple):
+                cur_i = k[1]
+                k = " "
+            if k in ("\x1b", "q"):
+                return
+            elif k in (curses.KEY_UP, "k"):
+                cur_i = max(0, cur_i - 1)
+            elif k in (curses.KEY_DOWN, "j"):
+                cur_i = min(len(items) - 1, cur_i + 1)
+            elif k == " ":
+                chosen ^= {cur_i}
+            elif k == "a":
+                chosen = set() if len(chosen) == len(items) else set(range(len(items)))
+            elif k in ("\n", "\r", curses.KEY_ENTER):
+                plan = [("copy", items[i]) for i in sorted(chosen or {cur_i})]
+                say(*run_quiet(apply_sync, plan, dst))
+                return
+
+    def do_alias_manager():
+        """Quản lý alias cho tài khoản Codex."""
+        target = ask("Tên profile hoặc email cần gán alias: ")
+        if not target:
+            return
+        new_alias = ask("Nhập alias mới (để trống để xoá alias): ")
+        if new_alias is None:
+            return
+        if new_alias:
+            good, lines = run_quiet(client.alias_set, target, new_alias)
+        else:
+            good, lines = run_quiet(client.alias_clear, target)
+        say(good, lines)
+
+    help_lines = [
+        "Điều hướng và phím tắt:",
+        "  ↑ ↓ / j k     chọn mục                Enter   mở / xác nhận",
+        "  Tab / c       đổi giữa Claude và Codex (trong agents-switch)",
+        "  1-8           mở mục theo số          Esc     quay lại (ở menu chính: thoát)",
+        "  chuột         bấm vào mục hoặc gợi ý phím ở chân màn hình; cuộn bằng bánh xe",
+        "",
+        "Trong danh sách profile:  Enter chuyển · d xoá · s lưu tài khoản hiện tại",
+        "Trong danh sách session:  Space đánh dấu · a chọn tất cả · Enter gộp",
+        "",
+        "Đối với Claude: Quota đọc từ ~/.claude.json, hỗ trợ gộp session Desktop.",
+        "Đối với Codex:  Tham khảo từ codex-auth, quản lý auth.json, hỗ trợ switch -",
+        "Sau khi chuyển đổi tài khoản, vui lòng khởi động lại client để nhận token mới.",
+    ]
+
+    def act(action) -> bool:
+        if action == "quit":
+            return True
+        S["msg"] = (True, [])
+        if action in ("switch", "usage", "remove"):
+            pick_profile(action)
+        elif action == "next":
+            if guard():
+                say(*run_quiet(client.next))
+        elif action == "switch_prev":
+            if guard():
+                say(*run_quiet(client.switch_prev))
+        elif action == "save":
+            do_save()
+        elif action == "alias":
+            do_alias_manager()
+        elif action == "sync":
+            do_sessions()
+        elif action == "doctor":
+            show_text(f"Kiểm tra cấu hình ({client.NAME})", run_quiet(client.doctor, raw=True)[1])
+        elif action == "help":
+            show_text("Trợ giúp", help_lines)
+        elif action == "toggle_client":
+            next_cid = "codex" if S["client_id"] == "claude" else "claude"
+            switch_client(next_cid)
+        S["rows"] = client.load_rows()
+        return False
+
+    while True:
+        S["draw"] = draw_home
+        draw_home()
+        k = getkey()
+        menu = get_menu()
+        if k in ("q", "\x1b"):
+            return
+        elif k in (curses.KEY_UP, "k"):
+            S["msel"] = (S["msel"] - 1) % len(menu)
+        elif k in (curses.KEY_DOWN, "j"):
+            S["msel"] = (S["msel"] + 1) % len(menu)
+        elif k == "\t":
+            if not client_lock:
+                next_cid = "codex" if S["client_id"] == "claude" else "claude"
+                switch_client(next_cid)
+        elif k == "?":
+            act("help")
+        elif k in ("\n", "\r", curses.KEY_ENTER):
+            if act(menu[S["msel"]][3]):
+                return
+        elif isinstance(k, str) and k in [m[0] for m in menu]:
+            idx = [m[0] for m in menu].index(k)
+            S["msel"] = idx
+            if act(menu[idx][3]):
+                return
+
+
+def start_ui(client_lock: str = None):
+    """Khởi động TUI, kiểm tra môi trường terminal trước."""
+    if curses is None:
+        die("TUI cần module curses (Windows chưa hỗ trợ). Dùng lệnh CLI: agents-switch help")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die("TUI cần terminal tương tác. Dùng lệnh CLI: agents-switch help")
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        curses.wrapper(lambda scr: _ui(scr, client_lock))
+    except KeyboardInterrupt:
+        pass
+
+
+# ==============================================================================
+# 5. CLI HELP & DISPATCHER
+# ==============================================================================
+
+def print_claude_help():
+    print(f"""claude-switch {VERSION} — chuyển đổi nhiều tài khoản Claude Code
+
+  claude-switch               Mở màn hình tương tác (TUI) — trong terminal
+  claude-switch ui            Như trên, gọi tường minh
+
+  claude-switch save [name]   Lưu tài khoản đang đăng nhập (bỏ trống name → lấy từ email)
+  claude-switch <name>        Chuyển sang tài khoản đã lưu
+  claude-switch list          Danh sách profile (* = đang dùng)
+  claude-switch status        Tài khoản đang dùng
+  claude-switch usage         Bảng quota 5h / 7 ngày của mọi profile
+  claude-switch next          Chuyển sang profile kế tiếp (vòng tròn)
+  claude-switch remove <name> Xoá profile
+  claude-switch sync-sessions Xem trước session Desktop của account khác (thêm --apply để gộp)
+        --session <id>  chỉ session có id/tên file chứa chuỗi này (lặp được)
+        --from <name>   chỉ session của profile/accountUuid này
+        --update        ghi đè khi bản nguồn có hoạt động mới hơn
+  claude-switch doctor        Kiểm tra cấu hình, quyền file, biến môi trường ghi đè
+  claude-switch version       In phiên bản
+
+Profile lưu ở ~/.claude-accounts (chmod 700, file 600) và CHỨA REFRESH TOKEN —
+đừng commit hay sync thư mục này lên cloud.
+
+Sau khi switch phải thoát và mở lại Claude Code; phiên đang chạy giữ token trong RAM.""")
+
+
+def print_codex_help():
+    print(f"""codex-switch {VERSION} — chuyển đổi nhiều tài khoản OpenAI Codex (tham khảo codex-auth)
+
+  codex-switch               Mở giao diện tương tác (TUI)
+  codex-switch save [name]   Lưu tài khoản từ ~/.codex/auth.json (tự sinh tên nếu bỏ trống)
+  codex-switch switch <name> Chuyển sang tài khoản đã lưu (hoặc dùng `codex-switch <name>`)
+  codex-switch switch -      Chuyển về tài khoản trước đó (hoặc `codex-switch -`)
+  codex-switch list          Danh sách profile Codex (* = đang dùng)
+  codex-switch status        Tài khoản Codex đang đăng nhập
+  codex-switch next          Chuyển sang tài khoản kế tiếp (vòng tròn)
+  codex-switch remove <name> Xoá profile (hoặc --all để xoá hết)
+  codex-switch alias set <q> <alias>  Đặt alias cho tài khoản
+  codex-switch alias clear <q>        Xoá alias của tài khoản
+  codex-switch login [--device-auth]  Chạy codex login rồi lưu profile
+  codex-switch export [dir]  Xuất auth snapshots thành file .auth.json
+  codex-switch import <path> Nhập file hoặc thư mục .auth.json vào profile
+  codex-switch doctor        Kiểm tra cấu hình và quyền bảo mật
+  codex-switch version       In phiên bản
+
+Tương thích với Codex CLI (@openai/codex), VS Code Extension và Codex App.""")
+
+
+def print_agents_help():
+    print(f"""agents-switch {VERSION} — Multi-Agent Multi-Client Account Switcher
+
+  agents-switch               Mở giao diện tương tác TUI (Tab / c để đổi giữa các client)
+  agents-switch clients       Liệt kê các AI clients được hỗ trợ (claude, codex)
+  agents-switch client [name] Xem hoặc đặt client mặc định
+  agents-switch status        Xem trạng thái tài khoản trên tất cả client
+  agents-switch doctor        Kiểm tra sức khoẻ cấu hình tất cả client
+  agents-switch list          Liệt kê profile của client hiện tại
+
+LỆNH THEO CLIENT CỤ THỂ:
+  agents-switch claude <cmd>  Gọi lệnh quản lý Claude Code:
+                              save [name], <name>, list, status, usage, next, remove, sync-sessions, doctor
+  agents-switch codex <cmd>   Gọi lệnh quản lý OpenAI Codex (tham khảo codex-auth):
+                              save [name], switch <name>, switch -, list, status, next, remove,
+                              alias set/clear, login, export, import, doctor
+
+LỆNH TẮT TƯƠNG THÍCH:
+  claude-switch <cmd>         Chạy chế độ Claude Code chuyên biệt (100% tương thích ngược)
+  codex-switch <cmd>          Chạy chế độ OpenAI Codex chuyên biệt
+
+Profile được lưu tại ~/.claude-accounts và ~/.codex-accounts (chmod 700 / 600).""")
+
+
+def dispatch_claude(c: ClaudeClient, cmd: str, args: list, arg: str):
+    """Phân phối lệnh cho client Claude Code."""
+    if cmd == "ui":
+        start_ui("claude")
+    elif cmd == "save":
+        with c.lock():
+            c.save(arg)
+    elif cmd in ("use", "switch"):
+        with c.lock():
+            if arg == "-":
+                c.switch_prev()
+            elif not arg:
+                if sys.stdin.isatty() and sys.stdout.isatty() and curses:
+                    start_ui("claude")
+                else:
+                    die("Usage: claude-switch switch <name|email>")
+            else:
+                c.use(arg)
+    elif cmd == "-":
+        with c.lock():
+            c.switch_prev()
+    elif cmd in ("list", "ls"):
+        c.list()
+    elif cmd in ("status", "current"):
+        c.status()
+    elif cmd == "usage":
+        c.usage()
+    elif cmd == "doctor":
+        c.doctor()
+    elif cmd == "next":
+        with c.lock():
+            c.next()
+    elif cmd in ("remove", "rm"):
+        with c.lock():
+            if not arg:
+                die("Usage: claude-switch remove <name>")
+            for a in args:
+                c.remove(a)
+    elif cmd == "sync-sessions":
+        c.sync_sessions(args)
+    elif cmd in ("version", "-v", "--version"):
+        print(VERSION)
+    elif cmd in ("help", "-h", "--help"):
+        print_claude_help()
+    else:
+        with c.lock():
+            c.use(cmd)
+
+
+def dispatch_codex(c: CodexClient, cmd: str, args: list, arg: str):
+    """Phân phối lệnh cho client OpenAI Codex."""
+    if cmd == "ui":
+        start_ui("codex")
+    elif cmd == "save":
+        with c.lock():
+            c.save(arg)
+    elif cmd in ("use", "switch"):
+        with c.lock():
+            if arg == "-":
+                c.switch_prev()
+            elif not arg:
+                if sys.stdin.isatty() and sys.stdout.isatty() and curses:
+                    start_ui("codex")
+                else:
+                    die("Usage: codex-switch switch <name|alias|email>")
+            else:
+                c.use(arg)
+    elif cmd == "-":
+        with c.lock():
+            c.switch_prev()
+    elif cmd in ("list", "ls"):
+        c.list()
+    elif cmd in ("status", "current"):
+        c.status()
+    elif cmd == "next":
+        with c.lock():
+            c.next()
+    elif cmd in ("remove", "rm"):
+        with c.lock():
+            all_flag = "--all" in args
+            filtered_args = [a for a in args if a != "--all"]
+            if not filtered_args and not all_flag:
+                die("Usage: codex-switch remove <name|alias|email>... hoặc codex-switch remove --all")
+            c.remove(*filtered_args, all_profiles=all_flag)
+    elif cmd == "alias":
+        with c.lock():
+            sub = args[0] if args else ""
+            if sub == "set" and len(args) >= 3:
+                c.alias_set(args[1], args[2])
+            elif sub == "clear" and len(args) >= 2:
+                c.alias_clear(args[1])
+            elif sub in ("", "list"):
+                c.list()
+            else:
+                die("Usage: codex-switch alias set <query> <alias> | codex-switch alias clear <query>")
+    elif cmd == "login":
+        device_auth = "--device-auth" in args
+        with c.lock():
+            c.login(device_auth=device_auth)
+    elif cmd == "export":
+        c.export(arg if arg and not arg.startswith("-") else "")
+    elif cmd == "import":
+        with c.lock():
+            c.import_auth(arg)
+    elif cmd == "doctor":
+        c.doctor()
+    elif cmd in ("version", "-v", "--version"):
+        print(VERSION)
+    elif cmd in ("help", "-h", "--help"):
+        print_codex_help()
+    else:
+        with c.lock():
+            c.use(cmd)
+
+
+def main():
+    """Hàm khởi động chính của agents-switch.
+    
+    Phát hiện chế độ hoạt động:
+    - Nếu chạy qua symlink/lệnh 'claude-switch': khoá sang Claude Code mode.
+    - Nếu chạy qua symlink/lệnh 'codex-switch': khoá sang Codex mode.
+    - Nếu chạy qua 'agents-switch':
+      - Kiểm tra cờ --client/-c hoặc tham số đầu là tên client ('claude', 'codex') -> chuyển vào client đó.
+      - Nếu là lệnh toàn cục ('clients', 'client', 'status', 'doctor') -> xử lý toàn cục.
+      - Nếu không có tham số: mở TUI đa client nếu có TTY, hoặc in help nếu qua pipe/script.
+    """
+    invoked_name = Path(sys.argv[0]).name
+
+    # 1. Chế độ tương thích claude-switch
+    if invoked_name == "claude-switch" or os.environ.get("AGENTS_SWITCH_MODE") == "claude":
+        claude_client = CLIENTS["claude"]
+        claude_client.ensure_dirs()
+        argv = sys.argv[1:] or (["ui"] if sys.stdin.isatty() and sys.stdout.isatty() and curses else ["help"])
+        cmd, args = argv[0], argv[1:]
+        arg = args[0] if args else ""
+        dispatch_claude(claude_client, cmd, args, arg)
+        return
+
+    # 2. Chế độ tương thích codex-switch
+    if invoked_name in ("codex-switch", "codex-auth") or os.environ.get("AGENTS_SWITCH_MODE") == "codex":
+        codex_client = CLIENTS["codex"]
+        codex_client.ensure_dirs()
+        argv = sys.argv[1:] or (["ui"] if sys.stdin.isatty() and sys.stdout.isatty() and curses else ["help"])
+        cmd, args = argv[0], argv[1:]
+        arg = args[0] if args else ""
+        dispatch_codex(codex_client, cmd, args, arg)
+        return
+
+    # 3. Chế độ chính: agents-switch (Multi-Client)
+    CLIENTS["claude"].ensure_dirs()
+    CLIENTS["codex"].ensure_dirs()
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    argv = sys.argv[1:]
+    if not argv:
+        if sys.stdin.isatty() and sys.stdout.isatty() and curses:
+            start_ui()
+        else:
+            print_agents_help()
+        return
+
+    first_arg = argv[0]
+
+    # Hỗ trợ cờ --client <id> hoặc -c <id>
+    if first_arg in ("--client", "-c") and len(argv) >= 2:
+        target_client = argv[1]
+        if target_client not in CLIENTS:
+            die(f"Client '{target_client}' không được hỗ trợ. Khả dụng: {', '.join(CLIENTS.keys())}")
+        c = CLIENTS[target_client]
+        sub_argv = argv[2:] or ["help"]
+        cmd, args = sub_argv[0], sub_argv[1:]
+        arg = args[0] if args else ""
+        if target_client == "claude":
+            dispatch_claude(c, cmd, args, arg)
+        else:
+            dispatch_codex(c, cmd, args, arg)
+        return
+
+    # Kiểm tra nếu chỉ định client cụ thể: `agents-switch claude <cmd>` hoặc `agents-switch codex <cmd>`
+    if first_arg in CLIENTS:
+        client_id = first_arg
+        c = CLIENTS[client_id]
+        sub_argv = argv[1:] or ["help"]
+        cmd, args = sub_argv[0], sub_argv[1:]
+        arg = args[0] if args else ""
+        if client_id == "claude":
+            dispatch_claude(c, cmd, args, arg)
+        else:
+            dispatch_codex(c, cmd, args, arg)
+        return
+
+    # Các lệnh toàn cục của agents-switch
+    if first_arg == "ui":
+        start_ui()
+    elif first_arg in ("clients", "--clients"):
+        cmd_clients()
+    elif first_arg == "client":
+        if len(argv) >= 2:
+            set_default_client_id(argv[1])
+        else:
+            print(f"Client mặc định hiện tại: {get_default_client_id()}")
+    elif first_arg in ("status", "current"):
+        cmd_status_all()
+    elif first_arg == "doctor":
+        cmd_doctor_all()
+    elif first_arg in ("version", "-v", "--version"):
+        print(VERSION)
+    elif first_arg in ("help", "-h", "--help"):
+        print_agents_help()
+    else:
+        # Chuyển tiếp tới client mặc định
+        def_id = get_default_client_id()
+        c = CLIENTS[def_id]
+        cmd, args = first_arg, argv[1:]
+        arg = args[0] if args else ""
+        if def_id == "claude":
+            dispatch_claude(c, cmd, args, arg)
+        else:
+            dispatch_codex(c, cmd, args, arg)
+
+
+if __name__ == "__main__":
+    main()
