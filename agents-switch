@@ -212,10 +212,15 @@ class ClaudeClient:
             self.creds_file.write_text(blob)
             os.chmod(self.creds_file, 0o600)
             return
+        # Đưa lệnh qua stdin của `security -i` để blob không lộ trong argv (xem được bằng `ps`).
+        # Chế độ interactive đọc theo dòng nên blob phải là JSON một dòng.
+        if "\n" in blob:
+            die("credential nhiều dòng, không ghi được vào Keychain")
+        q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
         r = subprocess.run(
-            ["security", "add-generic-password", "-U", "-a", os.environ.get("USER", ""),
-             "-s", self.kc_service, "-w", blob],
-            capture_output=True,
+            ["security", "-i"],
+            input=f'add-generic-password -U -a {q(os.environ.get("USER", ""))} -s {q(self.kc_service)} -w {q(blob)}\n',
+            text=True, capture_output=True,
         )
         if r.returncode != 0:
             die("không ghi được Keychain")
