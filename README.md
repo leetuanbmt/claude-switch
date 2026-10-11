@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20WSL-lightgrey">
+  <img alt="platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey">
   <img alt="python" src="https://img.shields.io/badge/python-3.8%2B-blue">
   <img alt="dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen">
   <img alt="tests" src="https://img.shields.io/badge/tests-53%2F53-brightgreen">
@@ -28,15 +28,26 @@ Công cụ hỗ trợ nhiều AI Agent clients:
 
 ## Cài đặt
 
+**macOS / Linux / WSL:**
 ```bash
 git clone https://github.com/leetuanbmt/claude-switch.git
 cd claude-switch && ./install.sh
 ```
 
-Script sẽ tự động tạo symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`):
+**Windows (PowerShell):**
+```powershell
+git clone https://github.com/leetuanbmt/claude-switch.git
+cd claude-switch; .\install.ps1
+```
+
+Trên macOS/Linux script tạo symlink vào thư mục đầu tiên có trong `PATH` (`~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`):
 - `agents-switch`: Hub trung tâm quản lý đa client.
 - `claude-switch`: Lệnh tắt tương thích ngược chuyên cho Claude Code.
 - `codex-switch`: Lệnh tắt chuyên cho OpenAI Codex.
+
+Trên Windows, `install.ps1` chép `agents-switch` vào `~/.local/bin` và tạo wrapper `.cmd` cho cả ba lệnh
+(symlink cần quyền đặc biệt trên Windows). NTFS không dùng bit `chmod 600`, nên refresh token trong
+`~/.claude-accounts/` chỉ được bảo vệ bằng quyền (ACL) của tài khoản Windows.
 
 Yêu cầu duy nhất là `python3` (3.8+) — có sẵn trên macOS và Linux/Ubuntu. Không cần cài thêm bất kỳ package nào.
 

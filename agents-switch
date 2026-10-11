@@ -50,12 +50,18 @@ try:
 except ImportError:
     curses = None
 
+# Console Windows mặc định không phải UTF-8 → in tiếng Việt sẽ ném UnicodeEncodeError.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8")
+
 # Thiết lập umask 0077: Mọi file/thư mục mới tạo chỉ user hiện tại có quyền đọc/ghi (chmod 600/700).
 # Điều này tối quan trọng vì profile chứa access token và refresh token.
 os.umask(0o077)
 
 # --- Các đường dẫn cơ sở (derive từ $HOME để hỗ trợ sandbox test khi override HOME) ---
-HOME = Path.home()
+HOME = Path(os.environ.get("CLAUDE_HOME") or os.environ.get("HOME") or Path.home())
 
 # Thư mục cấu hình chung của agents-switch
 AGENTS_DIR = HOME / ".agents-switch"
@@ -66,7 +72,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Đọc phiên bản từ file VERSION nằm cạnh script trong repo
 VERSION_FILE = Path(__file__).resolve().parent / "VERSION"
-VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "2.0.0"
+VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "2.0.0"
 
 
 def die(msg: str):
@@ -89,7 +95,7 @@ def write_json(path: Path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, path)
 
@@ -97,7 +103,7 @@ def write_json(path: Path, data):
 def load_json(path: Path) -> dict:
     """Đọc dữ liệu từ file JSON, trả về dict rỗng nếu file không tồn tại hoặc lỗi cú pháp."""
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -170,6 +176,11 @@ class ClaudeClient:
         if sys.platform == "darwin":
             return HOME / "Library/Application Support/Claude/claude-code-sessions"
         if os.name == "nt":
+            # Bản Claude Desktop cài từ Microsoft Store (MSIX) lưu dữ liệu trong package riêng.
+            local = Path(os.environ.get("LOCALAPPDATA") or HOME / "AppData/Local")
+            msix = local / "Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/claude-code-sessions"
+            if msix.exists():
+                return msix
             base = Path(os.environ.get("APPDATA") or HOME / "AppData/Roaming")
             return base / "Claude/claude-code-sessions"
         base = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
@@ -200,7 +211,7 @@ class ClaudeClient:
             Chuỗi JSON credential hoặc rỗng nếu chưa đăng nhập.
         """
         if self.use_file_backend():
-            return self.creds_file.read_text() if self.creds_file.exists() else ""
+            return self.creds_file.read_text(encoding="utf-8") if self.creds_file.exists() else ""
         user = os.environ.get("USER", "")
         if not user:
             try:
@@ -242,7 +253,7 @@ class ClaudeClient:
             die("credential rỗng, không ghi")
         if self.use_file_backend():
             self.creds_file.parent.mkdir(parents=True, exist_ok=True)
-            self.creds_file.write_text(blob)
+            self.creds_file.write_text(blob, encoding="utf-8")
             os.chmod(self.creds_file, 0o600)
             return
 
@@ -420,7 +431,7 @@ class ClaudeClient:
         if cur and cur != name:
             self.save(cur, quiet=True)
             print(f"[..] Đã cập nhật profile hiện tại: {cur}")
-            self.prev_file.write_text(cur)
+            self.prev_file.write_text(cur, encoding="utf-8")
         elif not cur and self.current_uuid():
             print("[!] Tài khoản đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
                   "    Huỷ (Ctrl-C) rồi chạy: claude-switch save <name>")
@@ -436,7 +447,7 @@ class ClaudeClient:
         if not creds:
             die(f"profile '{name}' không có credential hợp lệ")
         self.write_creds(json.dumps(creds) if isinstance(creds, dict) else str(creds))
-        self.state_file.write_text(name)
+        self.state_file.write_text(name, encoding="utf-8")
         ok(f"Đã chuyển sang '{name}'")
         n = process_count("claude")
         print(f"    Đang có {n} tiến trình claude chạy bằng token cũ — thoát hẳn rồi mở lại." if n
@@ -446,7 +457,7 @@ class ClaudeClient:
         """Chuyển đổi về tài khoản Claude Code trước đó (tương tự 'switch -' trong codex-auth)."""
         if not self.prev_file.exists():
             die("Chưa ghi nhận tài khoản trước đó để chuyển")
-        prev = self.prev_file.read_text().strip()
+        prev = self.prev_file.read_text(encoding="utf-8").strip()
         if not prev or not self.profile_path(prev).exists():
             die(f"Tài khoản trước đó '{prev}' không còn tồn tại")
         self.use(prev)
@@ -456,7 +467,7 @@ class ClaudeClient:
         names = self.profile_names()
         if not names:
             die("chưa có profile nào")
-        last = self.current_profile() or (self.state_file.read_text().strip() if self.state_file.exists() else "")
+        last = self.current_profile() or (self.state_file.read_text(encoding="utf-8").strip() if self.state_file.exists() else "")
         idx = names.index(last) if last in names else -1
         self.use(names[(idx + 1) % len(names)])
 
@@ -469,9 +480,9 @@ class ClaudeClient:
             die(f"không có profile '{query}'")
         f = self.profile_path(name)
         f.unlink(missing_ok=True)
-        if self.prev_file.exists() and self.prev_file.read_text().strip() == name:
+        if self.prev_file.exists() and self.prev_file.read_text(encoding="utf-8").strip() == name:
             self.prev_file.unlink(missing_ok=True)
-        if self.state_file.exists() and self.state_file.read_text().strip() == name:
+        if self.state_file.exists() and self.state_file.read_text(encoding="utf-8").strip() == name:
             self.state_file.unlink(missing_ok=True)
         ok(f"Đã xoá profile '{name}' (tài khoản trên server không bị ảnh hưởng)")
 
@@ -576,7 +587,7 @@ class ClaudeClient:
             if f.stat().st_mode & 0o077:
                 line("err", f"profile '{n}' chứa refresh token nhưng không phải chmod 600")
             try:
-                p = json.loads(f.read_text())
+                p = json.loads(f.read_text(encoding="utf-8"))
                 u = p["oauthAccount"]["accountUuid"]
                 assert p["credentials"] and p["userID"]
             except Exception:
@@ -1063,14 +1074,14 @@ class CodexClient:
         if cur and cur != name:
             self.save(cur, quiet=True)
             print(f"[..] Đã cập nhật profile hiện tại: {cur}")
-            self.prev_file.write_text(cur)
+            self.prev_file.write_text(cur, encoding="utf-8")
         elif not cur and self.auth_file.exists():
             print("[!] Tài khoản Codex đang đăng nhập chưa được lưu — sẽ mất truy cập nhanh tới nó.\n"
                   "    Huỷ (Ctrl-C) rồi chạy: codex-switch save <name>")
 
         self.backup_auth()
         write_json(self.auth_file, creds)
-        self.state_file.write_text(name)
+        self.state_file.write_text(name, encoding="utf-8")
 
         ok(f"Đã chuyển sang tài khoản Codex '{name}'")
         if self.restart_daemon():
@@ -1084,7 +1095,7 @@ class CodexClient:
         """Chuyển về tài khoản Codex trước đó (chức năng `codex-auth switch -`)."""
         if not self.prev_file.exists():
             die("Chưa ghi nhận tài khoản Codex trước đó để chuyển")
-        prev = self.prev_file.read_text().strip()
+        prev = self.prev_file.read_text(encoding="utf-8").strip()
         if not prev or not self.profile_path(prev).exists():
             die(f"Tài khoản trước đó '{prev}' không còn tồn tại")
         self.use(prev)
@@ -1094,7 +1105,7 @@ class CodexClient:
         names = self.profile_names()
         if not names:
             die("chưa có profile nào")
-        last = self.current_profile() or (self.state_file.read_text().strip() if self.state_file.exists() else "")
+        last = self.current_profile() or (self.state_file.read_text(encoding="utf-8").strip() if self.state_file.exists() else "")
         idx = names.index(last) if last in names else -1
         self.use(names[(idx + 1) % len(names)])
 
@@ -1119,9 +1130,9 @@ class CodexClient:
             if not name:
                 die(f"không tìm thấy profile Codex '{q}'")
             self.profile_path(name).unlink(missing_ok=True)
-            if self.state_file.exists() and self.state_file.read_text().strip() == name:
+            if self.state_file.exists() and self.state_file.read_text(encoding="utf-8").strip() == name:
                 self.state_file.unlink(missing_ok=True)
-            if self.prev_file.exists() and self.prev_file.read_text().strip() == name:
+            if self.prev_file.exists() and self.prev_file.read_text(encoding="utf-8").strip() == name:
                 self.prev_file.unlink(missing_ok=True)
             ok(f"Đã xoá profile Codex '{name}'")
 
@@ -1283,7 +1294,7 @@ class CodexClient:
             if f.stat().st_mode & 0o077:
                 line("err", f"profile '{n}' chứa credential nhưng không phải chmod 600")
             try:
-                p = json.loads(f.read_text())
+                p = json.loads(f.read_text(encoding="utf-8"))
                 assert p.get("credentials")
             except Exception:
                 line("err", f"profile '{n}' hỏng hoặc thiếu trường")
@@ -1317,7 +1328,7 @@ CLIENTS = {
 def get_default_client_id() -> str:
     """Lấy client mặc định từ cấu hình ~/.agents-switch/.current_client (mặc định 'claude')."""
     if DEFAULT_CLIENT_FILE.exists():
-        c = DEFAULT_CLIENT_FILE.read_text().strip()
+        c = DEFAULT_CLIENT_FILE.read_text(encoding="utf-8").strip()
         if c in CLIENTS:
             return c
     return "claude"
@@ -1328,7 +1339,7 @@ def set_default_client_id(client_id: str):
     if client_id not in CLIENTS:
         die(f"Client '{client_id}' không được hỗ trợ. Khả dụng: {', '.join(CLIENTS.keys())}")
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    DEFAULT_CLIENT_FILE.write_text(client_id)
+    DEFAULT_CLIENT_FILE.write_text(client_id, encoding="utf-8")
     ok(f"Đã đặt client mặc định là '{client_id}'")
 
 
