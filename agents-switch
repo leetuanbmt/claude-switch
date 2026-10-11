@@ -1485,7 +1485,7 @@ def _ui(scr, client_lock: str = None):
     S = {
         "client_id": active_cid,
         "rows": client.load_rows(),
-        "sel": 0, "top": 0, "msel": 0, "msg": (True, []),
+        "sel": 0, "top": 0, "msel": 0, "mtop": 0, "msg": (True, []),
         "prompt": None, "hits": [], "draw": None
     }
 
@@ -1575,9 +1575,11 @@ def _ui(scr, client_lock: str = None):
     def footer(h, hints):
         x = 1
         for key, label, val in hints:
+            w = len(key) + 1 + len(label)
+            if x + w > scr.getmaxyx()[1] - 2:  # hint cuối không vừa thì bỏ hẳn, không để bị cắt dở
+                break
             put(h - 1, x, key, colors["accent"] | BOLD)
             put(h - 1, x + len(key) + 1, label, DIM)
-            w = len(key) + 1 + len(label)
             if val is not None:
                 S["hits"].append((h - 1, x, x + w, val))
             x += w + 3
@@ -1601,7 +1603,7 @@ def _ui(scr, client_lock: str = None):
         scr.refresh()
 
     def draw_home():
-        f = frame(20, 48)
+        f = frame(10, 48)
         if not f:
             return
         h, w = f
@@ -1629,8 +1631,15 @@ def _ui(scr, client_lock: str = None):
         if not client_lock:
             info.append([("Client: ", 0), (client.NAME, colors["ok"]), ("  (Tab / c: đổi)", DIM)])
 
-        # Đủ chỗ thì vẽ khung tiêu đề + dòng trống, không thì thu về một dòng
-        boxed = h - 4 >= 3 + 1 + len(info) + 1 + 1 + len(menu) + 1
+        # Thiếu chỗ thì hy sinh theo thứ tự: khung tiêu đề → dòng phụ (từ cuối lên) → cuộn menu.
+        # Dòng "Tài khoản" và menu luôn được giữ vì đó là thứ người dùng cần để thao tác.
+        avail, nrows = h - 4, len(menu) + 1
+        boxed = avail >= 4 + len(info) + 1 + 1 + nrows
+        if not boxed:
+            n = len(info)
+            while n > 1 and avail < 1 + n + 1 + nrows:
+                n -= 1
+            info = info[:n]
         x0 = 2
         mw = min(w - 4, 72)
         y = 1 if boxed else 0
@@ -1657,30 +1666,49 @@ def _ui(scr, client_lock: str = None):
 
         put(y, x0, "?", colors["ok"] | BOLD)
         put(y, x0 + 2, "Chọn thao tác", BOLD)
-        put(y, x0 + 16, "(↑↓ chọn · ⏎ mở · phím số/chữ để mở nhanh)", DIM)
+        put(y, x0 + 16, "(↑↓ chọn · ⏎ mở)", DIM)
         y += 1
+
+        # Menu là viewport cuộn được: None = dòng ngăn cách trước «Thoát».
+        # Mục đang chọn luôn nằm trong vùng nhìn thấy; ▲/▼ báo còn mục bị che.
+        lines = []
+        for i, m in enumerate(menu):
+            if m[3] == "quit":
+                lines.append(None)
+            lines.append(i)
+        vh = h - 4 - y
+        pos = lines.index(S["msel"])
+        top = min(S["mtop"], max(0, len(lines) - vh))
+        top = pos if pos < top else pos - vh + 1 if pos >= top + vh else top
+        S["mtop"] = top
 
         # Biểu tượng theo bản chất thao tác để quét mắt nhanh
         icons = {"remove": "x", "quit": "x", "toggle_client": "<>", "switch_prev": "<-"}
-        for i, (key, label, desc, action) in enumerate(menu):
-            if action == "quit":
-                put(y, x0 + 2, ("─" if utf else "-") * 22, DIM)
-                y += 1
+        for r, i in enumerate(lines[top:top + vh]):
+            yy = y + r
+            if i is None:
+                put(yy, x0 + 2, ("─" if utf else "-") * 22, DIM)
+                continue
+            key, label, desc, action = menu[i]
             sel = i == S["msel"]
             attr = colors["accent"] | BOLD if sel else 0
             if sel:
-                put(y, x0, ARROW, colors["accent"] | BOLD)
-            put(y, x0 + 2, icons.get(action, ">"), attr or DIM)
-            put(y, x0 + 5, fit(label, 24), attr)
+                put(yy, x0, ARROW, colors["accent"] | BOLD)
+            put(yy, x0 + 2, icons.get(action, ">"), attr or DIM)
+            put(yy, x0 + 5, fit(label, 24), attr)
             if mw >= 56:
-                put(y, x0 + 30, fit(desc, mw - 30), DIM)
-            S["hits"].append((y, x0, x0 + mw, key))
-            y += 1
+                put(yy, x0 + 30, fit(desc, mw - 32), DIM)
+            S["hits"].append((yy, x0, x0 + mw, key))
+        if top > 0:
+            put(y, x0 + mw - 1, "▲" if utf else "^", colors["accent"])
+        if top + vh < len(lines):
+            put(y + vh - 1, x0 + mw - 1, "▼" if utf else "v", colors["accent"])
 
-        home_hints = [("↑↓", "chọn", None), ("1-8", "mở nhanh", None), ("⏎", "mở", "\n")]
+        # Xếp theo độ ưu tiên: terminal hẹp sẽ bỏ dần từ cuối
+        home_hints = [("↑↓", "chọn", None), ("⏎", "mở", "\n"), ("q", "thoát", "q"), ("?", "trợ giúp", "?")]
         if not client_lock:
             home_hints.append(("Tab", "đổi client", "\t"))
-        home_hints.extend([("?", "trợ giúp", "?"), ("q", "thoát", "q")])
+        home_hints.append(("1-8", "mở nhanh", None))
         bottom(h, w, home_hints)
 
     def draw_table(mode):
