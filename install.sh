@@ -12,8 +12,8 @@ BIN="$REPO_DIR/agents-switch"
 chmod +x "$BIN"
 
 # Đảm bảo symlink claude-switch và codex-switch tồn tại ngay trong repo
-ln -sf "$BIN" "$REPO_DIR/claude-switch"
-ln -sf "$BIN" "$REPO_DIR/codex-switch"
+ln -sfn agents-switch "$REPO_DIR/claude-switch"
+ln -sfn agents-switch "$REPO_DIR/codex-switch"
 
 # Chọn thư mục đầu tiên đang có trong PATH và người dùng có quyền ghi
 DEST=""
