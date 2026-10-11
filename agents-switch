@@ -259,28 +259,14 @@ class ClaudeClient:
             except Exception:
                 user = ""
 
-        # Cơ chế ghi Keychain 2 tầng:
-        # 1. Tầng ưu tiên bảo mật: Sử dụng `security -i` qua stdin nhằm tránh lộ token trong danh sách tiến trình (`ps`).
-        #    Chế độ interactive yêu cầu payload không có ký tự xuống dòng và chiều dài an toàn (<4000 byte)
-        #    để không làm tràn buffer cố định 4096 byte của /usr/bin/security trên macOS.
-        # 2. Tầng dự phòng / tải trọng lớn / đa dòng: Nếu chuỗi lệnh vượt ngưỡng 4000 byte, chứa ký tự xuống dòng,
-        #    hoặc `security -i` trả mã lỗi, fallback sang thực thi trực tiếp qua argv của `security add-generic-password`.
-        r = None
-        if "\n" not in blob:
-            q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
-            cmd_interactive = f'add-generic-password -U -a {q(user)} -s {q(self.kc_service)} -w {q(blob)}\n'
-            if len(cmd_interactive.encode("utf-8")) < 4000:
-                r = subprocess.run(
-                    ["security", "-i"],
-                    input=cmd_interactive,
-                    text=True, capture_output=True,
-                )
-
-        if r is None or r.returncode != 0:
-            r = subprocess.run(
-                ["security", "add-generic-password", "-U", "-a", user, "-s", self.kc_service, "-w", blob],
-                capture_output=True, text=True,
-            )
+        # Chỉ ghi qua stdin của `security -i` để token không lộ trong `ps`. Dòng lệnh của chế độ
+        # interactive bị giới hạn ~4096 byte nên blob quá lớn thì từ chối, không fallback sang argv.
+        q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        cmd = f'add-generic-password -U -a {q(user)} -s {q(self.kc_service)} -w {q(blob)}\n'
+        if "\n" in blob or len(cmd.encode("utf-8")) >= 4000:
+            die("credential quá lớn hoặc nhiều dòng, không ghi được Keychain qua stdin "
+                "(không dùng argv vì lộ token trong `ps`)")
+        r = subprocess.run(["security", "-i"], input=cmd, text=True, capture_output=True)
 
         if r.returncode != 0:
             err = r.stderr.strip() if r.stderr else ""

@@ -522,7 +522,7 @@ login_codex_as acc-del2 del2@test.com free; "$CX" save del-two >/dev/null
 "$AS" -c codex list | grep -q "PROFILE" || fail "agents-switch -c codex không hoạt động"
 "$AS" --client claude status | grep -q "Đang dùng:" || fail "agents-switch --client claude không hoạt động"
 
-# 54. Keychain backend: payload lớn (>4KB), payload nhỏ ưu tiên stdin, nén JSON, fallback khi lỗi, non-JSON multiline, decode hex UTF-8
+# 54. Keychain backend: payload lớn (>4KB), payload nhỏ ưu tiên stdin, nén JSON, từ chối (không argv) khi quá lớn/lỗi/multiline, decode hex UTF-8
 python3 -c '
 import importlib.machinery, importlib.util, json, os, sys
 
@@ -555,12 +555,18 @@ orig_run = mod.subprocess.run
 mod.subprocess.run = fake_subprocess_run
 
 try:
-    # Trường hợp 1: Payload lớn (>4000 byte) phải tự động dùng argv để tránh tràn buffer security -i
-    calls.clear()
-    large_payload = json.dumps({"token": "a" * 5000})
-    client.write_creds(large_payload)
-    assert not any(c[0] == ["security", "-i"] for c in calls), "Payload lớn không được gọi security -i"
-    assert any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "Payload lớn phải gọi argv add-generic-password"
+    def refused(payload):  # ghi bị từ chối (die → SystemExit) và token không bao giờ đi qua argv
+        calls.clear()
+        try:
+            client.write_creds(payload)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("write_creds phải từ chối payload này")
+        assert not any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "token không được lộ qua argv"
+
+    # Trường hợp 1: Payload lớn (>4000 byte) bị từ chối, không fallback sang argv
+    refused(json.dumps({"token": "a" * 5000}))
 
     # Trường hợp 2: Payload nhỏ (<4000 byte) ưu tiên gọi security -i để che giấu tham số qua ps
     calls.clear()
@@ -575,24 +581,18 @@ try:
     assert calls[0][0] == ["security", "-i"], "JSON nhiều dòng sau khi nén phải gọi được security -i"
     assert "\n" not in calls[0][1].get("input", "").strip(), "Input security -i không được có newline thừa"
 
-    # Trường hợp 4: Credential không phải JSON chứa newline tự động fallback sang argv thay vì abort
-    calls.clear()
-    raw_multiline = "plain-token\nwith-newline"
-    client.write_creds(raw_multiline)
-    assert not any(c[0] == ["security", "-i"] for c in calls), "Payload chứa newline không được gọi security -i"
-    assert any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "Payload chứa newline phải gọi argv add-generic-password"
+    # Trường hợp 4: Credential không phải JSON chứa newline bị từ chối, không fallback sang argv
+    refused("plain-token\nwith-newline")
 
-    # Trường hợp 5: Khi security -i trả mã lỗi (returncode != 0), tự động fallback sang argv add-generic-password
-    calls.clear()
+    # Trường hợp 5: Khi security -i trả mã lỗi (returncode != 0) thì báo lỗi, không fallback sang argv
     def fail_security_i(cmd, *args, **kwargs):
         calls.append((cmd, kwargs))
         if cmd == ["security", "-i"]:
             return mod.subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unknown error")
         return mod.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
     mod.subprocess.run = fail_security_i
-    client.write_creds(json.dumps({"token": "fallback_test"}))
+    refused(json.dumps({"token": "fallback_test"}))
     assert calls[0][0] == ["security", "-i"], "Trước tiên phải thử security -i"
-    assert any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "Phải fallback argv khi security -i thất bại"
     mod.subprocess.run = fake_subprocess_run
 
     # Trường hợp 6: read_creds tự động giải mã chuỗi hex trả về từ security find-generic-password khi chứa UTF-8
