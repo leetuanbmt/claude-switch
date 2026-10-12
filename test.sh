@@ -522,7 +522,7 @@ login_codex_as acc-del2 del2@test.com free; "$CX" save del-two >/dev/null
 "$AS" -c codex list | grep -q "PROFILE" || fail "agents-switch -c codex không hoạt động"
 "$AS" --client claude status | grep -q "Đang dùng:" || fail "agents-switch --client claude không hoạt động"
 
-# 54. Keychain backend: payload lớn (>4KB), payload nhỏ ưu tiên stdin, nén JSON, từ chối (không argv) khi quá lớn/lỗi/multiline, decode hex UTF-8
+# 54. Keychain backend: payload nhỏ ưu tiên stdin, nén JSON, payload lớn/multiline ghi qua Security.framework (không argv), từ chối khi lỗi, decode hex UTF-8
 python3 -c '
 import importlib.machinery, importlib.util, json, os, sys
 
@@ -565,8 +565,18 @@ try:
             raise AssertionError("write_creds phải từ chối payload này")
         assert not any(c[0][0:2] == ["security", "add-generic-password"] for c in calls), "token không được lộ qua argv"
 
-    # Trường hợp 1: Payload lớn (>4000 byte) bị từ chối, không fallback sang argv
-    refused(json.dumps({"token": "a" * 5000}))
+    # Trường hợp 1: Payload lớn (>4000 byte) ghi qua Security.framework, không đi qua security -i hay argv
+    native = []
+    mod.keychain_set_native = lambda svc, user, blob: native.append((svc, blob)) or 0
+    calls.clear()
+    big = json.dumps({"token": "a" * 5000}, separators=(",", ":"))
+    client.write_creds(big)
+    assert native == [(client.kc_service, big)], "Payload lớn phải được ghi nguyên vẹn qua native"
+    assert calls == [], "Payload lớn không được gọi security CLI (argv/stdin)"
+
+    # Trường hợp 1b: native trả OSStatus != 0 thì báo lỗi
+    mod.keychain_set_native = lambda svc, user, blob: -25293
+    refused(big)
 
     # Trường hợp 2: Payload nhỏ (<4000 byte) ưu tiên gọi security -i để che giấu tham số qua ps
     calls.clear()
@@ -581,8 +591,12 @@ try:
     assert calls[0][0] == ["security", "-i"], "JSON nhiều dòng sau khi nén phải gọi được security -i"
     assert "\n" not in calls[0][1].get("input", "").strip(), "Input security -i không được có newline thừa"
 
-    # Trường hợp 4: Credential không phải JSON chứa newline bị từ chối, không fallback sang argv
-    refused("plain-token\nwith-newline")
+    # Trường hợp 4: Credential không phải JSON chứa newline cũng đi qua native, không qua argv
+    native.clear()
+    mod.keychain_set_native = lambda svc, user, blob: native.append((svc, blob)) or 0
+    calls.clear()
+    client.write_creds("plain-token\nwith-newline")
+    assert native == [(client.kc_service, "plain-token\nwith-newline")] and calls == []
 
     # Trường hợp 5: Khi security -i trả mã lỗi (returncode != 0) thì báo lỗi, không fallback sang argv
     def fail_security_i(cmd, *args, **kwargs):

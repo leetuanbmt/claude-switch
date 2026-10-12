@@ -108,6 +108,22 @@ def load_json(path: Path) -> dict:
         return {}
 
 
+def keychain_set_native(service: str, user: str, blob: str) -> int:
+    """Ghi generic password qua Security.framework, trả về OSStatus (0 = thành công).
+
+    Dành cho blob mà `security -i` không nhận (vượt ~4096 byte/dòng, hoặc nhiều dòng):
+    token không đi qua argv nên không lộ trong `ps`.
+    """
+    import ctypes
+    sec = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+    s, a, b = service.encode(), user.encode(), blob.encode()
+    item = ctypes.c_void_p()
+    rc = sec.SecKeychainFindGenericPassword(None, len(s), s, len(a), a, None, None, ctypes.byref(item))
+    if rc == 0:
+        return sec.SecKeychainItemModifyAttributesAndData(item, None, len(b), b)
+    return sec.SecKeychainAddGenericPassword(None, len(s), s, len(a), a, len(b), b, None)
+
+
 def parse_jwt_payload(token: str) -> dict:
     """Giải mã payload của token JWT (JSON Web Token) mà không cần thư viện bên ngoài.
     
@@ -270,13 +286,15 @@ class ClaudeClient:
             except Exception:
                 user = ""
 
-        # Chỉ ghi qua stdin của `security -i` để token không lộ trong `ps`. Dòng lệnh của chế độ
-        # interactive bị giới hạn ~4096 byte nên blob quá lớn thì từ chối, không fallback sang argv.
+        # Token không bao giờ đi qua argv (lộ trong `ps`). Dòng lệnh của `security -i` bị giới hạn
+        # ~4096 byte và không chứa được xuống dòng; blob không vừa thì ghi thẳng qua Security.framework.
         q = lambda x: '"' + x.replace("\\", "\\\\").replace('"', '\\"') + '"'
         cmd = f'add-generic-password -U -a {q(user)} -s {q(self.kc_service)} -w {q(blob)}\n'
         if "\n" in blob or len(cmd.encode("utf-8")) >= 4000:
-            die("credential quá lớn hoặc nhiều dòng, không ghi được Keychain qua stdin "
-                "(không dùng argv vì lộ token trong `ps`)")
+            rc = keychain_set_native(self.kc_service, user, blob)
+            if rc != 0:
+                die(f"không ghi được Keychain (OSStatus {rc})")
+            return
         r = subprocess.run(["security", "-i"], input=cmd, text=True, capture_output=True)
 
         if r.returncode != 0:
